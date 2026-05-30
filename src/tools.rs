@@ -7,7 +7,8 @@
 //! Sicherheitshinweis: `bash` führt beliebige Befehle ungefragt aus. Für einen
 //! echten Agent ist eine Bestätigungs-/Genehmigungsschicht der nächste Schritt.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -17,8 +18,68 @@ use crate::llm::{ToolCall, ToolResult, ToolSpec};
 /// Maximale Zeichenzahl, die ein Tool-Ergebnis ans Modell zurückgibt — schützt
 /// das Kontextfenster vor riesigen Dateien/Ausgaben.
 const MAX_OUTPUT_CHARS: usize = 30_000;
+/// Maximale Diff-Zeilen, die `edit_file` im Tool-Ergebnis ausgibt.
+const MAX_DIFF_LINES: usize = 80;
+/// Kontextzeilen vor/nach dem bearbeiteten Bereich im Diff.
+const DIFF_CONTEXT_LINES: usize = 2;
 /// Zeitlimit für einen `bash`-Befehl.
 const BASH_TIMEOUT: Duration = Duration::from_secs(120);
+const FORBIDDEN_BASH_WRITE_PATTERNS: &[&str] = &[
+    ">",
+    ">>",
+    "tee ",
+    "python ",
+    "python3 ",
+    "perl ",
+    "ruby ",
+    "node ",
+    "sed -i",
+    "truncate ",
+    "rm ",
+    "mv ",
+    "cp ",
+    "touch ",
+    "chmod ",
+    "chown ",
+    "mkdir ",
+    "rmdir ",
+    "cat >",
+    "cat <<",
+    "git apply",
+    "git checkout",
+    "git restore",
+    "git reset",
+    "git clean",
+    "git rm",
+    "git mv",
+    "git add",
+    "git commit",
+    "cargo fmt",
+    "rustfmt",
+    "prettier --write",
+];
+
+/// Flüchtiger Tool-Zustand pro Agent-Session. Dient aktuell als Safeguard:
+/// `edit_file` darf nur Dateien bearbeiten, die vorher gelesen/geschrieben oder
+/// durch ein voriges Edit in diesen Zustand übernommen wurden.
+#[derive(Debug, Default)]
+pub struct ToolState {
+    read_files: HashMap<String, String>,
+}
+
+impl ToolState {
+    pub fn reset(&mut self) {
+        self.read_files.clear();
+    }
+
+    fn remember(&mut self, path: &str, content: String) {
+        self.read_files.insert(path_key(path), content);
+    }
+
+    fn read_snapshot(&self, path: &str) -> Option<&str> {
+        self.read_files.get(&path_key(path)).map(String::as_str)
+    }
+}
 
 /// Die Tool-Definitionen, die mit jedem Request ans Modell gehen.
 pub fn specs() -> Vec<ToolSpec> {
@@ -48,7 +109,7 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace an exact text snippet in a file. `old_string` must appear exactly once; include enough surrounding context to make it unique.",
+            description: "Replace an exact text snippet in a file. Safeguard: call read_file for the target file/range before edit_file. `old_string` must appear exactly once; include enough surrounding context to make it unique.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -61,11 +122,11 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash",
-            description: "Run a shell command via `sh -c` in the working directory. Returns stdout, stderr and the exit code.",
+            description: "Run a read-only shell command via `sh -c` in the working directory. Use this for inspection, builds and tests only. Do not modify files with bash; use write_file or edit_file for all file changes. Returns stdout, stderr and the exit code.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "The shell command to run." }
+                    "command": { "type": "string", "description": "Read-only shell command to run. Must not modify files." }
                 },
                 "required": ["command"]
             }),
@@ -91,11 +152,11 @@ pub const ASK_USER: &str = "ask_user";
 /// Führt einen Tool-Aufruf aus und verpackt das Ergebnis. Ein Fehler des Tools
 /// wird nicht durchgereicht, sondern als `is_error`-Ergebnis ans Modell gegeben,
 /// damit es selbst darauf reagieren kann.
-pub async fn execute(call: &ToolCall) -> ToolResult {
+pub async fn execute(call: &ToolCall, state: &mut ToolState) -> ToolResult {
     let outcome = match call.name.as_str() {
-        "read_file" => read_file(&call.arguments).await,
-        "write_file" => write_file(&call.arguments).await,
-        "edit_file" => edit_file(&call.arguments).await,
+        "read_file" => read_file(&call.arguments, state).await,
+        "write_file" => write_file(&call.arguments, state).await,
+        "edit_file" => edit_file(&call.arguments, state).await,
         "bash" => bash(&call.arguments).await,
         // Sollte vom Agent abgefangen werden, bevor es hierher kommt.
         ASK_USER => Err("ask_user wird vom Agent behandelt, nicht in execute().".to_string()),
@@ -116,14 +177,16 @@ pub async fn execute(call: &ToolCall) -> ToolResult {
     }
 }
 
-async fn read_file(args: &Value) -> Result<String, String> {
+async fn read_file(args: &Value, state: &mut ToolState) -> Result<String, String> {
     let path = string_arg(args, "path")?;
-    tokio::fs::read_to_string(&path)
+    let content = tokio::fs::read_to_string(&path)
         .await
-        .map_err(|e| format!("Konnte '{path}' nicht lesen: {e}"))
+        .map_err(|e| format!("Konnte '{path}' nicht lesen: {e}"))?;
+    state.remember(&path, content.clone());
+    Ok(content)
 }
 
-async fn write_file(args: &Value) -> Result<String, String> {
+async fn write_file(args: &Value, state: &mut ToolState) -> Result<String, String> {
     let path = string_arg(args, "path")?;
     let content = string_arg(args, "content")?;
 
@@ -136,16 +199,28 @@ async fn write_file(args: &Value) -> Result<String, String> {
     }
 
     let bytes = content.len();
-    tokio::fs::write(&path, content)
+    tokio::fs::write(&path, &content)
         .await
         .map_err(|e| format!("Konnte '{path}' nicht schreiben: {e}"))?;
+    state.remember(&path, content);
     Ok(format!("Datei geschrieben: {path} ({bytes} Bytes)."))
 }
 
-async fn edit_file(args: &Value) -> Result<String, String> {
+async fn edit_file(args: &Value, state: &mut ToolState) -> Result<String, String> {
     let path = string_arg(args, "path")?;
     let old = string_arg(args, "old_string")?;
     let new = string_arg(args, "new_string")?;
+
+    let Some(snapshot) = state.read_snapshot(&path) else {
+        return Err(format!(
+            "Safeguard: '{path}' muss vor edit_file mit read_file gelesen werden."
+        ));
+    };
+    if !snapshot.contains(&old) {
+        return Err(format!(
+            "Safeguard: old_string wurde im zuvor gelesenen Inhalt von '{path}' nicht gesehen. Bitte Datei/Bereich erneut lesen."
+        ));
+    }
 
     let content = tokio::fs::read_to_string(&path)
         .await
@@ -161,15 +236,25 @@ async fn edit_file(args: &Value) -> Result<String, String> {
         }
     }
 
+    let start = content
+        .find(&old)
+        .expect("match count above guaranteed one occurrence");
     let updated = content.replacen(&old, &new, 1);
-    tokio::fs::write(&path, updated)
+    tokio::fs::write(&path, &updated)
         .await
         .map_err(|e| format!("Konnte '{path}' nicht schreiben: {e}"))?;
-    Ok(format!("Datei bearbeitet: {path}."))
+    state.remember(&path, updated);
+
+    let diff = edit_diff(&content, start, &old, &new);
+    Ok(format!(
+        "Datei bearbeitet: {path}.
+{diff}"
+    ))
 }
 
 async fn bash(args: &Value) -> Result<String, String> {
     let command = string_arg(args, "command")?;
+    reject_mutating_bash(&command)?;
 
     let run = tokio::process::Command::new("sh")
         .arg("-c")
@@ -179,7 +264,11 @@ async fn bash(args: &Value) -> Result<String, String> {
         .output();
 
     let output = match tokio::time::timeout(BASH_TIMEOUT, run).await {
-        Err(_) => return Err(format!("Befehl hat das Zeitlimit ({BASH_TIMEOUT:?}) überschritten.")),
+        Err(_) => {
+            return Err(format!(
+                "Befehl hat das Zeitlimit ({BASH_TIMEOUT:?}) überschritten."
+            ));
+        }
         Ok(Err(e)) => return Err(format!("Befehl konnte nicht gestartet werden: {e}")),
         Ok(Ok(output)) => output,
     };
@@ -205,6 +294,73 @@ async fn bash(args: &Value) -> Result<String, String> {
     // Auch bei exit != 0 ist das ein gültiges Ergebnis (kein Tool-Fehler) — das
     // Modell soll den Exit-Code und stderr sehen und selbst reagieren.
     Ok(result)
+}
+
+/// Liest ein Pflicht-String-Argument aus dem JSON-Objekt.
+fn reject_mutating_bash(command: &str) -> Result<(), String> {
+    let compact = command.to_lowercase();
+    if FORBIDDEN_BASH_WRITE_PATTERNS
+        .iter()
+        .any(|pattern| compact.contains(pattern))
+    {
+        return Err(
+            "bash ist read-only: Dateiänderungen müssen über write_file oder edit_file erfolgen."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Liest ein Pflicht-String-Argument aus dem JSON-Objekt.
+fn path_key(path: &str) -> String {
+    let path = PathBuf::from(path);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    absolute.to_string_lossy().to_string()
+}
+
+fn edit_diff(before: &str, start_byte: usize, old: &str, new: &str) -> String {
+    let before_lines: Vec<&str> = before.split('\n').collect();
+    let start_line = before[..start_byte].bytes().filter(|b| *b == b'\n').count();
+    let old_line_count = old.split('\n').count();
+    let end_line = (start_line + old_line_count).min(before_lines.len());
+    let context_start = start_line.saturating_sub(DIFF_CONTEXT_LINES);
+    let context_end = (end_line + DIFF_CONTEXT_LINES).min(before_lines.len());
+
+    let mut lines = Vec::new();
+    lines.push("```diff".to_string());
+
+    for line in &before_lines[context_start..start_line] {
+        lines.push(format!("  {line}"));
+    }
+    for line in old.split('\n') {
+        lines.push(format!("- {line}"));
+    }
+    for line in new.split('\n') {
+        lines.push(format!("+ {line}"));
+    }
+    for line in &before_lines[end_line..context_end] {
+        lines.push(format!("  {line}"));
+    }
+
+    let hidden = lines.len().saturating_sub(MAX_DIFF_LINES + 1); // + Fence bleibt erhalten.
+    if hidden > 0 {
+        let mut limited = lines
+            .into_iter()
+            .take(MAX_DIFF_LINES.saturating_sub(1))
+            .collect::<Vec<_>>();
+        limited.push(format!("… {hidden} more lines"));
+        limited.push("```".to_string());
+        limited.join("\n")
+    } else {
+        lines.push("```".to_string());
+        lines.join("\n")
+    }
 }
 
 /// Liest ein Pflicht-String-Argument aus dem JSON-Objekt.
@@ -243,7 +399,11 @@ mod tests {
 
     #[tokio::test]
     async fn bash_runs_and_reports_exit() {
-        let result = execute(&call("bash", json!({ "command": "echo hallo" }))).await;
+        let result = execute(
+            &call("bash", json!({ "command": "echo hallo" })),
+            &mut ToolState::default(),
+        )
+        .await;
         assert!(!result.is_error);
         assert!(result.content.contains("hallo"));
         assert!(result.content.contains("[exit 0]"));
@@ -251,7 +411,11 @@ mod tests {
 
     #[tokio::test]
     async fn bash_nonzero_exit_is_not_a_tool_error() {
-        let result = execute(&call("bash", json!({ "command": "exit 3" }))).await;
+        let result = execute(
+            &call("bash", json!({ "command": "exit 3" })),
+            &mut ToolState::default(),
+        )
+        .await;
         assert!(!result.is_error); // Tool lief; der Exit-Code steht im Ergebnis
         assert!(result.content.contains("[exit 3]"));
     }
@@ -261,10 +425,15 @@ mod tests {
         let path = temp_path("rw.txt");
         let p = path.to_str().unwrap();
 
-        let written = execute(&call("write_file", json!({ "path": p, "content": "inhalt" }))).await;
+        let mut state = ToolState::default();
+        let written = execute(
+            &call("write_file", json!({ "path": p, "content": "inhalt" })),
+            &mut state,
+        )
+        .await;
         assert!(!written.is_error, "{}", written.content);
 
-        let read = execute(&call("read_file", json!({ "path": p }))).await;
+        let read = execute(&call("read_file", json!({ "path": p })), &mut state).await;
         assert!(!read.is_error);
         assert_eq!(read.content, "inhalt");
 
@@ -277,10 +446,15 @@ mod tests {
         let p = path.to_str().unwrap();
         std::fs::write(&path, "foo bar baz").unwrap();
 
-        let edited = execute(&call(
-            "edit_file",
-            json!({ "path": p, "old_string": "bar", "new_string": "qux" }),
-        ))
+        let mut state = ToolState::default();
+        let _ = execute(&call("read_file", json!({ "path": p })), &mut state).await;
+        let edited = execute(
+            &call(
+                "edit_file",
+                json!({ "path": p, "old_string": "bar", "new_string": "qux" }),
+            ),
+            &mut state,
+        )
         .await;
         assert!(!edited.is_error, "{}", edited.content);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo qux baz");
@@ -294,10 +468,15 @@ mod tests {
         let p = path.to_str().unwrap();
         std::fs::write(&path, "x x x").unwrap();
 
-        let edited = execute(&call(
-            "edit_file",
-            json!({ "path": p, "old_string": "x", "new_string": "y" }),
-        ))
+        let mut state = ToolState::default();
+        let _ = execute(&call("read_file", json!({ "path": p })), &mut state).await;
+        let edited = execute(
+            &call(
+                "edit_file",
+                json!({ "path": p, "old_string": "x", "new_string": "y" }),
+            ),
+            &mut state,
+        )
         .await;
         assert!(edited.is_error);
 
@@ -306,19 +485,23 @@ mod tests {
 
     #[tokio::test]
     async fn read_missing_file_is_error() {
-        let result = execute(&call("read_file", json!({ "path": "/no/such/anvil/path" }))).await;
+        let result = execute(
+            &call("read_file", json!({ "path": "/no/such/anvil/path" })),
+            &mut ToolState::default(),
+        )
+        .await;
         assert!(result.is_error);
     }
 
     #[tokio::test]
     async fn missing_argument_is_error() {
-        let result = execute(&call("bash", json!({}))).await;
+        let result = execute(&call("bash", json!({})), &mut ToolState::default()).await;
         assert!(result.is_error);
     }
 
     #[tokio::test]
     async fn unknown_tool_is_error() {
-        let result = execute(&call("frobnicate", json!({}))).await;
+        let result = execute(&call("frobnicate", json!({})), &mut ToolState::default()).await;
         assert!(result.is_error);
     }
 }

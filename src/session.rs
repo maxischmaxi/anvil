@@ -137,7 +137,11 @@ fn list_in(dir: &Path) -> Vec<SessionMeta> {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+        let Some(id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         let modified = entry
@@ -148,7 +152,11 @@ fn list_in(dir: &Path) -> Vec<SessionMeta> {
             .map(|h| h.title)
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| id.clone());
-        sessions.push(SessionMeta { id, title, modified });
+        sessions.push(SessionMeta {
+            id,
+            title,
+            modified,
+        });
     }
 
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
@@ -245,8 +253,10 @@ mod tests {
 
         assert_eq!(loaded.len(), 2);
         assert!(matches!(&loaded[0], ChatMessage::User(t) if t == "hallo"));
-        assert!(matches!(&loaded[1], ChatMessage::Assistant { text, tool_calls }
-            if text == "hi" && tool_calls.len() == 1 && tool_calls[0].name == "bash"));
+        assert!(
+            matches!(&loaded[1], ChatMessage::Assistant { text, tool_calls }
+            if text == "hi" && tool_calls.len() == 1 && tool_calls[0].name == "bash")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

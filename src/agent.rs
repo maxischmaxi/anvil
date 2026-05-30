@@ -21,7 +21,10 @@ use crate::tools;
 const SYSTEM_PROMPT: &str = "Du bist anvil, ein Coding-Agent, der in einem Terminal läuft. \
      Du hast Werkzeuge, um Dateien zu lesen, zu schreiben und zu bearbeiten sowie Shell-Befehle \
      auszuführen. Nutze sie eigenständig, um die Aufgabe des Nutzers zu erledigen, statt nur zu \
-     beschreiben, was zu tun wäre. Fasse dich kurz. Antworte in der Sprache des Nutzers.";
+     beschreiben, was zu tun wäre. Wichtig: Quellcode- und Dateiänderungen dürfen ausschließlich \
+     über write_file oder edit_file erfolgen. bash ist nur für read-only Inspektion, Builds und Tests; \
+     nutze bash niemals, um Dateien per Python/Sed/Redirect/etc. zu verändern. Fasse dich kurz. \
+     Antworte in der Sprache des Nutzers.";
 
 /// Obergrenze für Tool-Runden pro Prompt — verhindert Endlosschleifen, falls das
 /// Modell immer weiter Tools aufruft.
@@ -43,6 +46,7 @@ pub async fn run(
     events: UnboundedSender<AgentEvent>,
 ) {
     let tools = tools::specs();
+    let mut tool_state = tools::ToolState::default();
     let mut history: Vec<ChatMessage> = Vec::new();
     let mut session: Option<SessionWriter> = None;
 
@@ -66,13 +70,18 @@ pub async fn run(
                     &mut cancel,
                     &events,
                     &mut session,
+                    &mut tool_state,
                     prompt,
                 )
                 .await;
             }
             // Eine gespeicherte Sitzung fortsetzen.
-            AgentCommand::SetContext { history: loaded, id } => {
+            AgentCommand::SetContext {
+                history: loaded,
+                id,
+            } => {
                 history = loaded;
+                tool_state.reset();
                 session = match SessionWriter::open(&id) {
                     Ok(writer) => Some(writer),
                     Err(error) => {
@@ -86,6 +95,7 @@ pub async fn run(
             // Frische Sitzung: Kontext und Datei-Handle fallenlassen.
             AgentCommand::Reset => {
                 history.clear();
+                tool_state.reset();
                 session = None;
             }
         }
@@ -105,6 +115,7 @@ async fn handle_prompt(
     cancel: &mut UnboundedReceiver<()>,
     events: &UnboundedSender<AgentEvent>,
     session: &mut Option<SessionWriter>,
+    tool_state: &mut tools::ToolState,
     prompt: String,
 ) {
     // Veraltete Abbruch-Signale verwerfen, bevor der Turn beginnt.
@@ -131,7 +142,9 @@ async fn handle_prompt(
 
         let turn = match step {
             Step::Turn(turn) => turn,
-            Step::Failed(reason) => return abort(history, restore_to, events, AgentEvent::Error(reason)),
+            Step::Failed(reason) => {
+                return abort(history, restore_to, events, AgentEvent::Error(reason));
+            }
             Step::Cancelled => return abort(history, restore_to, events, AgentEvent::Cancelled),
         };
 
@@ -162,7 +175,7 @@ async fn handle_prompt(
 
             let _ = events.send(AgentEvent::ToolStarted(describe_call(call)));
             let result = tokio::select! {
-                result = tools::execute(call) => result,
+                result = tools::execute(call, tool_state) => result,
                 _ = cancel.recv() => return abort(history, restore_to, events, AgentEvent::Cancelled),
             };
             let _ = events.send(AgentEvent::ToolFinished {
@@ -267,6 +280,9 @@ fn describe_call(call: &ToolCall) -> String {
 
 /// Erste nicht-leere Zeile eines Tool-Ergebnisses, gekürzt — als kurze Statuszeile.
 fn summarize(content: &str) -> String {
+    if let Some((first, diff)) = content.split_once("\n```diff") {
+        return format!("{}\n```diff{}", first.trim_end(), diff);
+    }
     let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     shorten(first, 80)
 }

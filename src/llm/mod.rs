@@ -28,7 +28,10 @@ pub enum ChatMessage {
     /// Eine Texteingabe des Nutzers.
     User(String),
     /// Ein Assistenten-Turn: Text (ggf. leer) plus 0..n Tool-Aufrufe.
-    Assistant { text: String, tool_calls: Vec<ToolCall> },
+    Assistant {
+        text: String,
+        tool_calls: Vec<ToolCall>,
+    },
     /// Ergebnisse ausgeführter Tools, die zurück ans Modell gehen.
     ToolResults(Vec<ToolResult>),
 }
@@ -122,13 +125,25 @@ impl LlmClient {
         match self.kind {
             ProviderKind::Anthropic => {
                 anthropic::stream(
-                    &self.http, &self.api_key, &self.model, system, messages, tools, on_text,
+                    &self.http,
+                    &self.api_key,
+                    &self.model,
+                    system,
+                    messages,
+                    tools,
+                    on_text,
                 )
                 .await
             }
             ProviderKind::OpenAi => {
                 openai::stream(
-                    &self.http, &self.api_key, &self.model, system, messages, tools, on_text,
+                    &self.http,
+                    &self.api_key,
+                    &self.model,
+                    system,
+                    messages,
+                    tools,
+                    on_text,
                 )
                 .await
             }

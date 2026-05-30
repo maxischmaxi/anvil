@@ -20,7 +20,9 @@ pub fn load() -> Result<LlmClient, String> {
     let kind = match preferred.as_deref() {
         Some("anthropic") => {
             if anthropic_key.is_none() {
-                return Err("ANVIL_PROVIDER=anthropic, aber ANTHROPIC_API_KEY ist nicht gesetzt.".into());
+                return Err(
+                    "ANVIL_PROVIDER=anthropic, aber ANTHROPIC_API_KEY ist nicht gesetzt.".into(),
+                );
             }
             ProviderKind::Anthropic
         }

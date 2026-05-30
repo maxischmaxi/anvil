@@ -10,7 +10,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::event::{AgentCommand, AgentEvent};
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, ToolResult};
 use crate::session::{self, SessionId};
 
 /// Wer eine Nachricht im Verlauf geschrieben hat.
@@ -52,6 +52,8 @@ pub enum Status {
 
 /// Spinner-Frames (Braille) für den „anvil arbeitet"-Indikator.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const LARGE_PASTE_LINE_THRESHOLD: usize = 8;
+const LARGE_PASTE_CHAR_THRESHOLD: usize = 1_200;
 
 /// Der komplette Anwendungszustand.
 pub struct App {
@@ -66,13 +68,19 @@ pub struct App {
     /// Der gerade entstehende Block (gestreamte Antwort oder laufendes Tool),
     /// live im Viewport. Ist er fertig, wandert er in den Scrollback.
     pending: Option<Message>,
+    /// Alle bereits committed Blöcke. Wird gehalten, damit bei Terminal-Resize
+    /// die komplette History mit neuer Breite neu gerendert werden kann.
+    transcript: Vec<Message>,
     /// Fertige Blöcke, die der Haupt-Loop per `insert_before` in den echten
-    /// Terminal-Scrollback schiebt (und dann leert). Die App hält die History
-    /// also nicht selbst — das Terminal tut es.
+    /// Terminal-Scrollback schiebt (und dann leert).
     scrollback: Vec<Message>,
     /// Zuletzt per `/sessions` angezeigte Sitzungen (Reihenfolge = Nummerierung),
     /// damit `/resume <n>` die richtige id auflösen kann.
     session_list: Vec<SessionId>,
+    /// Einmaliges Signal an den Haupt-Loop, Bildschirm + Scrollback zu löschen.
+    clear_requested: bool,
+    /// Einmaliges Signal an den Haupt-Loop, die gesamte History neu zu rendern.
+    reflow_requested: bool,
     /// Kanal zum Agent-Task (Prompts/Antworten).
     commands: UnboundedSender<AgentCommand>,
     /// Separater Kanal, um einen laufenden Turn abzubrechen.
@@ -92,8 +100,11 @@ impl App {
             should_quit: false,
             spinner_frame: 0,
             pending: None,
+            transcript: Vec::new(),
             scrollback: vec![Message::new(Role::System, intro)],
             session_list: Vec::new(),
+            clear_requested: false,
+            reflow_requested: false,
             commands,
             cancel,
         }
@@ -104,6 +115,11 @@ impl App {
     fn insert_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        self.input.insert_str(self.cursor, text);
+        self.cursor += text.len();
     }
 
     fn delete_backward(&mut self) {
@@ -188,7 +204,8 @@ impl App {
         };
         let left = self.input[prev..last].to_string();
         let right = self.input[last..self.cursor].to_string();
-        self.input.replace_range(prev..self.cursor, &format!("{right}{left}"));
+        self.input
+            .replace_range(prev..self.cursor, &format!("{right}{left}"));
     }
 
     /// Byte-Offset des vorherigen Wortanfangs: erst Nicht-Wort-Zeichen, dann
@@ -273,6 +290,7 @@ impl App {
             "sessions" | "ls" | "list" => self.cmd_sessions(),
             "resume" | "open" => self.cmd_resume(arg),
             "new" => self.cmd_new(),
+            "clear" | "cls" => self.cmd_clear(),
             "help" | "?" => self.cmd_help(),
             other => self.note(format!(
                 "Unbekannter Befehl: /{other}. /help zeigt alle Befehle."
@@ -330,12 +348,26 @@ impl App {
         self.note("Neue Sitzung gestartet.".to_string());
     }
 
+    fn cmd_clear(&mut self) {
+        let _ = self.commands.send(AgentCommand::Reset);
+        self.input.clear();
+        self.cursor = 0;
+        self.status = Status::Idle;
+        self.pending = None;
+        self.transcript.clear();
+        self.scrollback.clear();
+        self.session_list.clear();
+        self.clear_requested = true;
+        self.reflow_requested = false;
+    }
+
     fn cmd_help(&mut self) {
         self.note(
             "Befehle:\n  \
              /sessions      gespeicherte Sitzungen auflisten\n  \
              /resume <n>    Sitzung n fortsetzen\n  \
              /new           neue Sitzung beginnen\n  \
+             /clear         neue blanke Sitzung + UI löschen\n  \
              /help          diese Hilfe"
                 .to_string(),
         );
@@ -418,6 +450,24 @@ impl App {
         }
     }
 
+    /// Reagiert auf eingefügten Text. Kleine Pastes landen unverändert in der
+    /// Eingabe (inkl. Zeilenumbrüchen); sehr große Pastes werden kompakt als
+    /// Platzhalter eingefügt, damit das Prompt-Fenster nicht explodiert.
+    pub fn on_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let line_count = normalized.lines().count().max(1);
+        let char_count = normalized.chars().count();
+        if line_count > LARGE_PASTE_LINE_THRESHOLD || char_count > LARGE_PASTE_CHAR_THRESHOLD {
+            self.insert_str(&format!("[{line_count} inserted lines]"));
+        } else {
+            self.insert_str(&normalized);
+        }
+    }
+
     /// Reagiert auf eine Meldung des Agent-Tasks.
     pub fn on_agent_event(&mut self, event: AgentEvent) {
         match event {
@@ -440,7 +490,8 @@ impl App {
             }
             AgentEvent::AskUser(question) => {
                 self.commit_pending();
-                self.scrollback.push(Message::new(Role::Assistant, question));
+                self.scrollback
+                    .push(Message::new(Role::Assistant, question));
                 self.status = Status::AwaitingAnswer;
             }
             AgentEvent::Done => {
@@ -481,9 +532,34 @@ impl App {
         }
     }
 
-    /// Entnimmt die fertigen Blöcke, die in den Terminal-Scrollback sollen.
+    /// Entnimmt die fertigen Blöcke, die in den Terminal-Scrollback sollen, und
+    /// archiviert sie für späteres Reflow bei Terminal-Resize.
     pub fn drain_scrollback(&mut self) -> Vec<Message> {
-        std::mem::take(&mut self.scrollback)
+        let messages = std::mem::take(&mut self.scrollback);
+        self.transcript.extend(messages.iter().cloned());
+        messages
+    }
+
+    /// Signalisiert, dass die gespeicherte History mit aktueller Terminalbreite
+    /// neu in den Scrollback gerendert werden soll.
+    pub fn request_reflow(&mut self) {
+        self.reflow_requested = true;
+    }
+
+    /// Gibt die komplette History für ein einmaliges Reflow zurück. Noch nicht
+    /// geflushte Blöcke werden vorher archiviert, damit nichts verloren geht.
+    pub fn take_reflow_messages(&mut self) -> Option<Vec<Message>> {
+        if !std::mem::take(&mut self.reflow_requested) {
+            return None;
+        }
+        let queued = std::mem::take(&mut self.scrollback);
+        self.transcript.extend(queued);
+        Some(self.transcript.clone())
+    }
+
+    /// Gibt ein angefordertes Terminal-Clear einmalig an den Haupt-Loop weiter.
+    pub fn take_clear_requested(&mut self) -> bool {
+        std::mem::take(&mut self.clear_requested)
     }
 
     /// Schaltet den Spinner einen Frame weiter (vom Render-Tick aufgerufen).
@@ -504,35 +580,68 @@ fn is_word_char(c: char) -> bool {
 }
 
 /// Wandelt einen geladenen Verlauf in Anzeige-Nachrichten für den Scrollback um.
-/// Tool-Ergebnisse bleiben im Kontext, werden aber nicht erneut ausgebreitet.
+/// Tool-Ergebnisse werden an die zugehörigen Tool-Blöcke gehängt, damit
+/// fortgesetzte Sessions nicht dauerhaft „läuft …" anzeigen.
 fn history_to_display(history: &[ChatMessage]) -> Vec<Message> {
     let mut out = Vec::new();
+    let mut pending_tools: Vec<Message> = Vec::new();
     for message in history {
         match message {
-            ChatMessage::User(text) => out.push(Message::new(Role::User, text.clone())),
+            ChatMessage::User(text) => {
+                out.append(&mut pending_tools);
+                out.push(Message::new(Role::User, text.clone()));
+            }
             ChatMessage::Assistant { text, tool_calls } => {
+                out.append(&mut pending_tools);
                 if !text.is_empty() {
                     out.push(Message::new(Role::Assistant, text.clone()));
                 }
-                for call in tool_calls {
-                    let detail = call
-                        .arguments
-                        .get("command")
-                        .or_else(|| call.arguments.get("path"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let title = if detail.is_empty() {
-                        call.name.clone()
-                    } else {
-                        format!("{} · {}", call.name, detail)
-                    };
-                    out.push(Message::new(Role::Tool, title));
-                }
+                pending_tools = tool_calls
+                    .iter()
+                    .map(|call| {
+                        let detail = call
+                            .arguments
+                            .get("command")
+                            .or_else(|| call.arguments.get("path"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let title = if detail.is_empty() {
+                            call.name.clone()
+                        } else {
+                            format!("{} · {}", call.name, detail)
+                        };
+                        Message::new(Role::Tool, title)
+                    })
+                    .collect();
             }
-            ChatMessage::ToolResults(_) => {}
+            ChatMessage::ToolResults(results) => {
+                attach_tool_results(&mut pending_tools, results);
+                out.append(&mut pending_tools);
+            }
         }
     }
+    out.append(&mut pending_tools);
     out
+}
+
+fn attach_tool_results(messages: &mut [Message], results: &[ToolResult]) {
+    for (message, result) in messages.iter_mut().zip(results) {
+        let mark = if result.is_error { "✗" } else { "→" };
+        message
+            .content
+            .push_str(&format!("\n  {mark} {}", summarize_tool_result(&result.content)));
+    }
+}
+
+fn summarize_tool_result(content: &str) -> String {
+    if let Some((first, diff)) = content.split_once("\n```diff") {
+        return format!("{}\n```diff{}", first.trim_end(), diff);
+    }
+    content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Grobe relative Zeitangabe für die Sitzungsliste.

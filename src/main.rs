@@ -19,11 +19,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures::StreamExt;
-use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{Event as TerminalEvent, EventStream};
-use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::crossterm::cursor::MoveTo;
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event as TerminalEvent, EventStream,
+};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size};
 use ratatui::widgets::{Paragraph, Widget};
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::{Terminal, TerminalOptions, Viewport, layout::Rect};
 use tokio::sync::mpsc;
 
 use crate::app::App;
@@ -61,12 +65,11 @@ fn setup_terminal() -> Result<Tui> {
     }));
 
     enable_raw_mode()?;
-    // Kompaktes Fenster: obere Linie + eine Eingabezeile. So gibt es im Leerlauf
-    // keine Leerzeilen-Lücke; mehrzeilige Eingabe scrollt intern. (Die
-    // Inline-Höhe ist nach init fix — größer = mehr sichtbare Eingabezeilen,
-    // aber wieder Luft im Leerlauf.)
+    execute!(std::io::stdout(), EnableBracketedPaste)?;
+    // Kompaktes Fenster: obere Linie + bis zu fünf Eingabezeilen. So kann die
+    // Prompt-Eingabe bei langen Zeilen sichtbar umbrechen.
     let rows = size().map(|(_, r)| r).unwrap_or(24);
-    let viewport_height = rows.clamp(1, 2);
+    let viewport_height = rows.clamp(2, 6);
     let backend = CrosstermBackend::new(std::io::stdout());
     let terminal = Terminal::with_options(
         backend,
@@ -79,6 +82,8 @@ fn setup_terminal() -> Result<Tui> {
 
 fn restore_terminal(terminal: &mut Tui) {
     let _ = terminal.clear();
+    let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
+    let _ = Backend::flush(terminal.backend_mut());
     let _ = disable_raw_mode();
 }
 
@@ -99,6 +104,13 @@ async fn run(terminal: &mut Tui, client: Option<llm::LlmClient>, intro: String) 
     terminal.draw(|frame| ui::render_viewport(frame, &app))?;
 
     while !app.should_quit {
+        if app.take_clear_requested() {
+            clear_terminal(terminal)?;
+        }
+        if let Some(messages) = app.take_reflow_messages() {
+            reflow_terminal(terminal, messages)?;
+        }
+
         flush_scrollback(terminal, &mut app)?;
         terminal.draw(|frame| ui::render_viewport(frame, &app))?;
 
@@ -106,7 +118,9 @@ async fn run(terminal: &mut Tui, client: Option<llm::LlmClient>, intro: String) 
             _ = ticker.tick() => app.tick(),
             maybe_terminal = terminal_events.next() => match maybe_terminal {
                 Some(Ok(TerminalEvent::Key(key))) => app.on_key(key),
-                Some(Ok(_)) => {} // Resize/Maus/Paste: nächste Schleife zeichnet neu
+                Some(Ok(TerminalEvent::Paste(text))) => app.on_paste(&text),
+                Some(Ok(TerminalEvent::Resize(width, height))) => resize_terminal(terminal, &mut app, width, height)?,
+                Some(Ok(_)) => {} // Maus/Fokus: nächste Schleife zeichnet neu
                 Some(Err(_)) | None => app.should_quit = true,
             },
             maybe_event = event_rx.recv() => {
@@ -122,10 +136,38 @@ async fn run(terminal: &mut Tui, client: Option<llm::LlmClient>, intro: String) 
     Ok(())
 }
 
+fn clear_terminal(terminal: &mut Tui) -> Result<()> {
+    execute!(
+        terminal.backend_mut(),
+        Clear(ClearType::All),
+        Clear(ClearType::Purge),
+        MoveTo(0, 0)
+    )?;
+    terminal.clear()?;
+    Ok(())
+}
+
+fn resize_terminal(terminal: &mut Tui, app: &mut App, width: u16, height: u16) -> Result<()> {
+    terminal.resize(Rect::new(0, 0, width, height))?;
+    app.request_reflow();
+    Ok(())
+}
+
+fn reflow_terminal(terminal: &mut Tui, messages: Vec<crate::app::Message>) -> Result<()> {
+    clear_terminal(terminal)?;
+    insert_messages(terminal, messages)?;
+    Ok(())
+}
+
 /// Schreibt alle fertigen Blöcke per `insert_before` in den Terminal-Scrollback.
 fn flush_scrollback(terminal: &mut Tui, app: &mut App) -> Result<()> {
-    let (width, _) = size().unwrap_or((80, 24));
-    for message in app.drain_scrollback() {
+    let messages = app.drain_scrollback();
+    insert_messages(terminal, messages)
+}
+
+fn insert_messages(terminal: &mut Tui, messages: Vec<crate::app::Message>) -> Result<()> {
+    let width = terminal.backend().size()?.width;
+    for message in messages {
         let mut lines = ui::message_lines(&message, width);
         lines.push(ratatui::text::Line::from(String::new())); // Leerzeile zwischen Blöcken
         let height = lines.len() as u16;
