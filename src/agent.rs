@@ -49,14 +49,15 @@ pub async fn run(
     let mut tool_state = tools::ToolState::default();
     let mut history: Vec<ChatMessage> = Vec::new();
     let mut session: Option<SessionWriter> = None;
+    let mut client = client;
 
     while let Some(command) = commands.recv().await {
         match command {
             AgentCommand::Prompt(prompt) => {
                 let Some(client) = client.as_ref() else {
                     let _ = events.send(AgentEvent::Error(
-                        "Kein Provider aktiv (API-Key fehlt). Setze ANTHROPIC_API_KEY \
-                         oder OPENAI_API_KEY und starte anvil neu."
+                        "Kein Provider aktiv. Melde dich mit /login <provider> an \
+                         (oder setze z. B. OPENAI_API_KEY) — ein Neustart ist nicht nötig."
                             .to_string(),
                     ));
                     continue;
@@ -91,6 +92,14 @@ pub async fn run(
                         None
                     }
                 };
+            }
+            // Provider/Modell wechseln, ohne den Kontext zu verlieren.
+            AgentCommand::SetClient {
+                kind,
+                model,
+                secret,
+            } => {
+                client = Some(LlmClient::new(kind, secret.0, Some(model)));
             }
             // Frische Sitzung: Kontext und Datei-Handle fallenlassen.
             AgentCommand::Reset => {

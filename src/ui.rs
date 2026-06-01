@@ -421,17 +421,29 @@ pub fn render_viewport(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
     // Spinner/Hinweis sitzt im Titel der oberen Linie — so braucht es keine
-    // eigene Zeile (und keine Leerzeile im Leerlauf).
-    let title = match app.status {
-        Status::Thinking => Span::styled(
-            format!(" {} anvil arbeitet …  (Esc bricht ab)", app.spinner()),
-            Style::new().fg(Color::Yellow),
-        ),
-        Status::AwaitingAnswer => Span::styled(
-            " ⌨ Rückfrage — gib deine Antwort ein".to_string(),
+    // eigene Zeile (und keine Leerzeile im Leerlauf). Die maskierte Key-Eingabe
+    // hat Vorrang vor dem Status.
+    let title = if app.masking() {
+        Span::styled(
+            " 🔑 API-Key eingeben — Enter speichert, Esc bricht ab".to_string(),
             Style::new().fg(Color::Magenta),
-        ),
-        Status::Idle => Span::raw(String::new()),
+        )
+    } else {
+        match app.status {
+            Status::Thinking => Span::styled(
+                format!(" {} anvil arbeitet …  (Esc bricht ab)", app.spinner()),
+                Style::new().fg(Color::Yellow),
+            ),
+            Status::AwaitingAnswer => Span::styled(
+                " ⌨ Rückfrage — gib deine Antwort ein".to_string(),
+                Style::new().fg(Color::Magenta),
+            ),
+            // Im Leerlauf das aktive Modell dezent anzeigen (wie opencodes Status).
+            Status::Idle => match app.active_label() {
+                Some(label) => Span::styled(format!(" {label}"), Style::new().fg(Color::DarkGray)),
+                None => Span::raw(String::new()),
+            },
+        }
     };
 
     let block = Block::default()
@@ -441,9 +453,14 @@ pub fn render_viewport(frame: &mut Frame, app: &App) {
     let inner = block.inner(area);
     let input_visible = (inner.height as usize).max(1);
 
-    // Eingabe visuell umbrechen + Cursor-Position (Zeile/Spalte) bestimmen.
+    // Eingabe visuell umbrechen + Cursor-Position (Zeile/Spalte) bestimmen. Bei
+    // maskierter Key-Eingabe (/login) `*` statt der echten Zeichen zeigen —
+    // API-Keys sind ASCII, daher bleiben die Byte-Offsets des Cursors gültig.
     let input_width = inner.width.saturating_sub(PROMPT_WIDTH).max(1) as usize;
-    let (visual_lines, cursor_row, cursor_col) = wrap_input(&app.input, app.cursor, input_width);
+    let masked = app.masking().then(|| "*".repeat(app.input.len()));
+    let input_for_display = masked.as_deref().unwrap_or(&app.input);
+    let (visual_lines, cursor_row, cursor_col) =
+        wrap_input(input_for_display, app.cursor, input_width);
 
     // So scrollen, dass die Cursorzeile im sichtbaren Fenster liegt.
     let max_scroll = visual_lines.len().saturating_sub(input_visible);

@@ -1,4 +1,9 @@
-//! OpenAI-Adapter (Chat Completions API).
+//! OpenAI-kompatibler Adapter (Chat Completions API).
+//!
+//! Dasselbe Wire-Format bedienen mehrere Provider — OpenAI, Google Gemini (über
+//! deren OpenAI-kompatiblen Endpunkt) und OpenRouter. Sie unterscheiden sich nur
+//! in `base_url` und im Bearer-Secret; deshalb nimmt [`stream`] beides als
+//! Parameter statt sie hart zu verdrahten.
 //!
 //! System-Prompt = normale Message. Tool-Calls kommen im Stream über
 //! `choices[].delta.tool_calls[]` — fragmentiert und **pro Index** akkumuliert
@@ -13,11 +18,11 @@ use serde_json::{Value, json};
 
 use super::{AssistantTurn, ChatMessage, ToolCall, ToolSpec};
 
-const API_URL: &str = "https://api.openai.com/v1/chat/completions";
-
+#[allow(clippy::too_many_arguments)]
 pub async fn stream(
     http: &reqwest::Client,
-    api_key: &str,
+    base_url: &str,
+    bearer: &str,
     model: &str,
     system: Option<&str>,
     messages: &[ChatMessage],
@@ -46,17 +51,17 @@ pub async fn stream(
     }
 
     let response = http
-        .post(API_URL)
-        .bearer_auth(api_key)
+        .post(base_url)
+        .bearer_auth(bearer)
         .json(&body)
         .send()
         .await
-        .context("OpenAI-Request fehlgeschlagen")?;
+        .context("Provider-Request fehlgeschlagen")?;
 
     if !response.status().is_success() {
         let status = response.status();
         let detail = response.text().await.unwrap_or_default();
-        bail!("OpenAI API {status}: {detail}");
+        bail!("Provider-API {status}: {detail}");
     }
 
     let mut text = String::new();

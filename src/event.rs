@@ -3,7 +3,7 @@
 //! Die einzige Schnittstelle zwischen den beiden Welten: Die UI schickt
 //! [`AgentCommand`]s rein, der Agent meldet [`AgentEvent`]s zurück.
 
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, ProviderKind, Secret};
 
 /// Was die UI dem Agent-Task aufträgt.
 #[derive(Debug, Clone)]
@@ -15,6 +15,13 @@ pub enum AgentCommand {
     SetContext {
         history: Vec<ChatMessage>,
         id: String,
+    },
+    /// Provider/Modell zur Laufzeit wechseln (über `/models` bzw. nach `/login`).
+    /// Der Gesprächskontext bleibt erhalten — nur der Client wird getauscht.
+    SetClient {
+        kind: ProviderKind,
+        model: String,
+        secret: Secret,
     },
     /// Eine frische Sitzung beginnen (Kontext leeren).
     Reset,

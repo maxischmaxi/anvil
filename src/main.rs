@@ -7,9 +7,11 @@
 
 mod agent;
 mod app;
+mod auth;
 mod config;
 mod event;
 mod llm;
+mod oauth;
 mod session;
 mod tools;
 mod ui;
@@ -93,9 +95,12 @@ async fn run(terminal: &mut Tui, client: Option<llm::LlmClient>, intro: String) 
     let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<()>();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
+    // Aktiven Provider/Modell festhalten, bevor der Client in den Task wandert,
+    // damit /models das gerade laufende Modell markieren kann.
+    let active = client.as_ref().map(|c| (c.kind(), c.model().to_string()));
     tokio::spawn(agent::run(client, command_rx, cancel_rx, event_tx));
 
-    let mut app = App::new(command_tx, cancel_tx, intro);
+    let mut app = App::new(command_tx, cancel_tx, intro, active);
     let mut terminal_events = EventStream::new();
     // Periodischer Tick, damit der Spinner animiert (und der Viewport frisch bleibt).
     let mut ticker = tokio::time::interval(Duration::from_millis(120));

@@ -170,11 +170,17 @@ fn read_header(path: &Path) -> Option<Header> {
     serde_json::from_str(first_line.trim()).ok()
 }
 
-/// Verzeichnis für Sitzungen: `$ANVIL_HOME` bzw. `$XDG_CONFIG_HOME/anvil` bzw.
-/// `~/.config/anvil`, jeweils plus `sessions/`.
-pub fn sessions_dir() -> Result<PathBuf> {
+/// Basis-Konfigurationsverzeichnis (`$ANVIL_HOME` bzw. `$XDG_CONFIG_HOME/anvil`
+/// bzw. `~/.config/anvil`). Hier liegen `sessions/` und `auth.json`.
+pub fn config_dir() -> Result<PathBuf> {
     let base = base_dir().context("Konnte kein Konfigurationsverzeichnis bestimmen (HOME?)")?;
-    let dir = base.join("sessions");
+    std::fs::create_dir_all(&base).with_context(|| format!("Verzeichnis {base:?} anlegen"))?;
+    Ok(base)
+}
+
+/// Verzeichnis für Sitzungen: [`config_dir`] plus `sessions/`.
+pub fn sessions_dir() -> Result<PathBuf> {
+    let dir = config_dir()?.join("sessions");
     std::fs::create_dir_all(&dir).with_context(|| format!("Verzeichnis {dir:?} anlegen"))?;
     Ok(dir)
 }

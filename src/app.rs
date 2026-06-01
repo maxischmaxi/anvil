@@ -9,8 +9,10 @@ use std::time::SystemTime;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::auth::{self, AuthInfo};
+use crate::config;
 use crate::event::{AgentCommand, AgentEvent};
-use crate::llm::{ChatMessage, ToolResult};
+use crate::llm::{ChatMessage, ProviderKind, Secret, ToolResult};
 use crate::session::{self, SessionId};
 
 /// Wer eine Nachricht im Verlauf geschrieben hat.
@@ -77,6 +79,16 @@ pub struct App {
     /// Zuletzt per `/sessions` angezeigte Sitzungen (Reihenfolge = Nummerierung),
     /// damit `/resume <n>` die richtige id auflösen kann.
     session_list: Vec<SessionId>,
+    /// Aktiver Provider + Modell (für die Statuszeile und die `●`-Markierung in
+    /// `/models`). `None`, solange kein Credential vorliegt.
+    active: Option<(ProviderKind, String)>,
+    /// Zuletzt per `/models` angezeigte Provider/Modell-Kombis (Nummerierung für
+    /// `/models <n>`).
+    model_list: Vec<(ProviderKind, String)>,
+    /// Läuft gerade eine maskierte Key-Eingabe (`/login <provider>`)? Dann wird
+    /// die nächste Eingabe als Secret behandelt, maskiert und nicht in den
+    /// Scrollback gespiegelt.
+    secret_entry: Option<ProviderKind>,
     /// Einmaliges Signal an den Haupt-Loop, Bildschirm + Scrollback zu löschen.
     clear_requested: bool,
     /// Einmaliges Signal an den Haupt-Loop, die gesamte History neu zu rendern.
@@ -92,6 +104,7 @@ impl App {
         commands: UnboundedSender<AgentCommand>,
         cancel: UnboundedSender<()>,
         intro: String,
+        active: Option<(ProviderKind, String)>,
     ) -> Self {
         Self {
             input: String::new(),
@@ -103,11 +116,26 @@ impl App {
             transcript: Vec::new(),
             scrollback: vec![Message::new(Role::System, intro)],
             session_list: Vec::new(),
+            active,
+            model_list: Vec::new(),
+            secret_entry: None,
             clear_requested: false,
             reflow_requested: false,
             commands,
             cancel,
         }
+    }
+
+    /// Ob gerade ein Secret (API-Key) maskiert eingegeben wird.
+    pub fn masking(&self) -> bool {
+        self.secret_entry.is_some()
+    }
+
+    /// Label des aktiven Modells für die Statuszeile, z. B. `"OpenAI · gpt-5.5"`.
+    pub fn active_label(&self) -> Option<String> {
+        self.active
+            .as_ref()
+            .map(|(kind, model)| format!("{} · {}", kind.display(), model))
     }
 
     // ---- Eingabe-Bearbeitung (Unicode-sicher über Byte-Offsets) ----
@@ -255,6 +283,20 @@ impl App {
     }
 
     fn submit(&mut self) {
+        // Maskierte Key-Eingabe (/login): die Eingabe ist das Secret, nicht ein
+        // Prompt oder Befehl — abfangen, bevor irgendetwas in den Scrollback geht.
+        if let Some(kind) = self.secret_entry.take() {
+            let key = self.input.trim().to_string();
+            self.input.clear();
+            self.cursor = 0;
+            if key.is_empty() {
+                self.note("Login abgebrochen (kein Key eingegeben).".to_string());
+            } else {
+                self.store_and_activate_key(kind, key);
+            }
+            return;
+        }
+
         let text = self.input.trim().to_string();
         if text.is_empty() {
             return;
@@ -286,11 +328,16 @@ impl App {
         let mut parts = command.split_whitespace();
         let name = parts.next().unwrap_or("");
         let arg = parts.next();
+        // Rest der Zeile (für /login <provider> [key|oauth]).
+        let rest = command[name.len()..].trim();
         match name {
             "sessions" | "ls" | "list" => self.cmd_sessions(),
             "resume" | "open" => self.cmd_resume(arg),
             "new" => self.cmd_new(),
             "clear" | "cls" => self.cmd_clear(),
+            "models" | "model" => self.cmd_models(arg),
+            "login" | "auth" => self.cmd_login(rest),
+            "logout" => self.cmd_logout(arg),
             "help" | "?" => self.cmd_help(),
             other => self.note(format!(
                 "Unbekannter Befehl: /{other}. /help zeigt alle Befehle."
@@ -361,6 +408,175 @@ impl App {
         self.reflow_requested = false;
     }
 
+    // ---- /models ----
+
+    fn cmd_models(&mut self, arg: Option<&str>) {
+        if let Some(sel) = arg {
+            self.cmd_models_select(sel);
+            return;
+        }
+        self.model_list.clear();
+        let mut text = String::from("Modelle (● = aktiv) — /models <n> zum Wechseln:\n");
+        for kind in ProviderKind::ALL {
+            if config::secret_for(kind).is_some() {
+                for model in kind.models() {
+                    self.model_list.push((kind, (*model).to_string()));
+                    let n = self.model_list.len();
+                    let active = self
+                        .active
+                        .as_ref()
+                        .is_some_and(|(k, m)| *k == kind && m == model);
+                    let mark = if active { "●" } else { " " };
+                    text.push_str(&format!("  {n:>2}  {mark} {} · {model}\n", kind.display()));
+                }
+            } else {
+                text.push_str(&format!(
+                    "       · {} — nicht angemeldet (/login {})\n",
+                    kind.display(),
+                    kind.id()
+                ));
+            }
+        }
+        if self.model_list.is_empty() {
+            text.push_str("\nNoch kein Provider angemeldet. /login <provider> zum Start.");
+        }
+        self.note(text);
+    }
+
+    fn cmd_models_select(&mut self, sel: &str) {
+        let Some(number) = sel.parse::<usize>().ok() else {
+            self.note("Nutzung: /models <nummer> — erst /models ausführen.".to_string());
+            return;
+        };
+        let Some((kind, model)) = self.model_list.get(number.wrapping_sub(1)).cloned() else {
+            self.note("Keine Modellnummer. Erst /models ausführen.".to_string());
+            return;
+        };
+        self.switch_to(kind, model);
+    }
+
+    /// Schaltet Provider+Modell zur Laufzeit um (Kontext bleibt erhalten).
+    fn switch_to(&mut self, kind: ProviderKind, model: String) {
+        let Some(secret) = config::secret_for(kind) else {
+            self.note(format!(
+                "Kein Credential für {}. Erst /login {}.",
+                kind.display(),
+                kind.id()
+            ));
+            return;
+        };
+        let _ = self.commands.send(AgentCommand::SetClient {
+            kind,
+            model: model.clone(),
+            secret: Secret(secret),
+        });
+        self.note(format!("Aktiv: {} · {model}", kind.display()));
+        self.active = Some((kind, model));
+    }
+
+    // ---- /login + /logout ----
+
+    fn cmd_login(&mut self, rest: &str) {
+        let mut parts = rest.split_whitespace();
+        let Some(id) = parts.next() else {
+            self.cmd_login_list();
+            return;
+        };
+        let Some(kind) = provider_from_arg(id) else {
+            self.note(format!(
+                "Unbekannter Provider: {id}. Bekannt: openai, anthropic, google, openrouter."
+            ));
+            return;
+        };
+        match parts.next() {
+            Some("oauth") => self.cmd_login_oauth(kind),
+            Some(key) => {
+                // Inline-Key: bequem, aber sichtbar.
+                self.note(
+                    "Hinweis: der Key stand sichtbar in der Eingabe. Für maskierte Eingabe \
+                     nur '/login <provider>' (ohne Key) verwenden."
+                        .to_string(),
+                );
+                self.store_and_activate_key(kind, key.to_string());
+            }
+            None => {
+                self.secret_entry = Some(kind);
+                self.note(format!(
+                    "🔑 API-Key für {} eingeben — Enter speichert, Esc bricht ab. \
+                     (Die Eingabe wird maskiert.)",
+                    kind.display()
+                ));
+            }
+        }
+    }
+
+    fn cmd_login_list(&mut self) {
+        let mut text = String::from("Anmelden mit /login <provider>:\n");
+        for kind in ProviderKind::ALL {
+            let status = match config::source_label(kind) {
+                Some(src) => format!("✓ angemeldet ({src})"),
+                None => "— nicht angemeldet".to_string(),
+            };
+            text.push_str(&format!(
+                "  {:<11}{:<16}{status}\n",
+                kind.id(),
+                kind.display()
+            ));
+        }
+        text.push_str(
+            "\n/login <provider>     Key maskiert eingeben\n\
+             /login <provider> oauth   (Subscription-Login — siehe Hinweis)\n\
+             /logout <provider>    gespeicherten Key entfernen",
+        );
+        self.note(text);
+    }
+
+    fn cmd_login_oauth(&mut self, kind: ProviderKind) {
+        if kind.supports_oauth() {
+            // Seam: hier liefe der echte PKCE-Flow über crate::oauth.
+            self.note(format!("OAuth-Flow für {} ist noch nicht verdrahtet.", kind.display()));
+        } else {
+            self.note(format!(
+                "Für {} ist bewusst kein Subscription-/OAuth-Login hinterlegt — das würde in \
+                 einem Drittanbieter-Agenten gegen die AGB des Anbieters verstoßen (genau wie bei \
+                 Anthropic). Das PKCE-Gerüst liegt in src/oauth.rs bereit; wer einen erlaubten \
+                 Flow hat, hängt dort eine OAuthConfig ein. Bis dahin: /login {} mit API-Key.",
+                kind.display(),
+                kind.id()
+            ));
+        }
+    }
+
+    fn store_and_activate_key(&mut self, kind: ProviderKind, key: String) {
+        match auth::set(kind.id(), AuthInfo::Api { key }) {
+            Ok(()) => {
+                self.note(format!("✓ {} angemeldet — API-Key gespeichert.", kind.display()));
+                // Direkt aktiv schalten — praktisch, wenn vorher kein Provider lief.
+                self.switch_to(kind, kind.default_model().to_string());
+            }
+            Err(error) => self.note(format!("Konnte Key nicht speichern: {error:#}")),
+        }
+    }
+
+    fn cmd_logout(&mut self, arg: Option<&str>) {
+        let Some(id) = arg else {
+            self.note("Nutzung: /logout <provider>.".to_string());
+            return;
+        };
+        let Some(kind) = provider_from_arg(id) else {
+            self.note(format!("Unbekannter Provider: {id}."));
+            return;
+        };
+        match auth::remove(kind.id()) {
+            Ok(true) => self.note(format!(
+                "{} abgemeldet (gespeicherter Key entfernt).",
+                kind.display()
+            )),
+            Ok(false) => self.note(format!("Für {} war kein Key gespeichert.", kind.display())),
+            Err(error) => self.note(format!("Konnte Key nicht entfernen: {error:#}")),
+        }
+    }
+
     fn cmd_help(&mut self) {
         self.note(
             "Befehle:\n  \
@@ -368,6 +584,9 @@ impl App {
              /resume <n>    Sitzung n fortsetzen\n  \
              /new           neue Sitzung beginnen\n  \
              /clear         neue blanke Sitzung + UI löschen\n  \
+             /models [n]    Modelle anzeigen / Provider+Modell wechseln\n  \
+             /login [prov]  Provider anmelden (API-Key, maskiert)\n  \
+             /logout <prov> gespeicherten Key entfernen\n  \
              /help          diese Hilfe"
                 .to_string(),
         );
@@ -381,6 +600,12 @@ impl App {
     /// Esc: läuft ein Turn, wird er abgebrochen; sonst wird die Eingabe geleert.
     /// (Beenden geht über Strg+C.)
     fn on_escape(&mut self) {
+        if self.secret_entry.take().is_some() {
+            self.input.clear();
+            self.cursor = 0;
+            self.note("Login abgebrochen.".to_string());
+            return;
+        }
         match self.status {
             Status::Thinking | Status::AwaitingAnswer => {
                 let _ = self.cancel.send(());
@@ -579,6 +804,14 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Provider aus einem `/login`/`/logout`-Argument auflösen (inkl. Alias `gemini`).
+fn provider_from_arg(id: &str) -> Option<ProviderKind> {
+    ProviderKind::from_id(id).or(match id {
+        "gemini" => Some(ProviderKind::Gemini),
+        _ => None,
+    })
+}
+
 /// Wandelt einen geladenen Verlauf in Anzeige-Nachrichten für den Scrollback um.
 /// Tool-Ergebnisse werden an die zugehörigen Tool-Blöcke gehängt, damit
 /// fortgesetzte Sessions nicht dauerhaft „läuft …" anzeigen.
@@ -666,10 +899,26 @@ mod tests {
     fn app_with(input: &str, cursor: usize) -> App {
         let (commands, _command_rx) = mpsc::unbounded_channel();
         let (cancel, _cancel_rx) = mpsc::unbounded_channel();
-        let mut app = App::new(commands, cancel, String::new());
+        let mut app = App::new(commands, cancel, String::new(), None);
         app.input = input.to_string();
         app.cursor = cursor;
         app
+    }
+
+    #[test]
+    fn login_enters_then_escapes_masked_entry() {
+        let mut app = app_with("", 0);
+        app.handle_command("login openai");
+        assert!(app.masking(), "/login <provider> startet die maskierte Eingabe");
+        app.on_escape();
+        assert!(!app.masking(), "Esc bricht die Key-Eingabe ab");
+    }
+
+    #[test]
+    fn login_unknown_provider_does_not_mask() {
+        let mut app = app_with("", 0);
+        app.handle_command("login does-not-exist");
+        assert!(!app.masking());
     }
 
     #[test]

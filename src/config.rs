@@ -1,61 +1,81 @@
-//! Konfiguration beim Start: welche API-Keys liegen in der Umgebung, und
-//! welcher Provider wird daraus gewählt.
+//! Provider-Auswahl beim Start — und die gemeinsame Stelle, an der ein Secret zu
+//! einem Provider aufgelöst wird (Env **oder** gespeicherte `auth.json`).
 //!
 //! Regeln:
-//! - `ANVIL_PROVIDER=anthropic|openai` erzwingt einen Provider (Fehler, wenn der
-//!   passende Key fehlt).
-//! - Ohne Vorgabe: ist nur ein Key gesetzt, wird der genommen; sind beide
-//!   gesetzt, gewinnt Anthropic.
-//! - `ANVIL_MODEL` überschreibt das Default-Modell des gewählten Providers.
+//! - `ANVIL_PROVIDER=openai|anthropic|google|gemini|openrouter` erzwingt einen
+//!   Provider (Fehler, wenn dafür kein Credential vorliegt).
+//! - Ohne Vorgabe: der erste Provider aus [`ProviderKind::ALL`], für den ein
+//!   Credential existiert.
+//! - `ANVIL_MODEL` überschreibt das Default-Modell.
+//!
+//! Ein Credential kommt entweder aus der provider-spezifischen Env-Variable
+//! (Vorrang) oder aus `/login` (`auth.json`).
 
+use crate::auth::{self, AuthInfo};
 use crate::llm::{LlmClient, ProviderKind};
 
-/// Liest die Umgebung und baut einen [`LlmClient`]. Bei `Err` enthält der String
-/// eine menschenlesbare Erklärung, die direkt im UI angezeigt werden kann.
+/// Liest die Umgebung + gespeicherte Auth und baut einen [`LlmClient`]. Bei `Err`
+/// enthält der String eine menschenlesbare Erklärung fürs UI.
 pub fn load() -> Result<LlmClient, String> {
-    let anthropic_key = read_env("ANTHROPIC_API_KEY");
-    let openai_key = read_env("OPENAI_API_KEY");
-    let preferred = read_env("ANVIL_PROVIDER").map(|s| s.to_lowercase());
+    let model_override = read_env("ANVIL_MODEL");
 
-    let kind = match preferred.as_deref() {
-        Some("anthropic") => {
-            if anthropic_key.is_none() {
-                return Err(
-                    "ANVIL_PROVIDER=anthropic, aber ANTHROPIC_API_KEY ist nicht gesetzt.".into(),
-                );
-            }
-            ProviderKind::Anthropic
-        }
-        Some("openai") => {
-            if openai_key.is_none() {
-                return Err("ANVIL_PROVIDER=openai, aber OPENAI_API_KEY ist nicht gesetzt.".into());
-            }
-            ProviderKind::OpenAi
-        }
-        Some(other) => {
-            return Err(format!(
-                "Unbekannter ANVIL_PROVIDER={other:?}. Erlaubt sind: anthropic, openai."
-            ));
-        }
-        None => match (anthropic_key.is_some(), openai_key.is_some()) {
-            (true, _) => ProviderKind::Anthropic, // bei beiden Keys: Anthropic als Default
-            (false, true) => ProviderKind::OpenAi,
-            (false, false) => {
-                return Err(
-                    "Kein API-Key gefunden. Setze ANTHROPIC_API_KEY oder OPENAI_API_KEY \
-                     (oder beide) und starte neu."
-                        .into(),
-                );
-            }
-        },
-    };
+    if let Some(pref) = read_env("ANVIL_PROVIDER") {
+        let kind = resolve_provider(&pref).ok_or_else(|| {
+            format!("Unbekannter ANVIL_PROVIDER={pref:?}. Erlaubt: openai, anthropic, google, openrouter.")
+        })?;
+        let secret = secret_for(kind).ok_or_else(|| {
+            format!(
+                "ANVIL_PROVIDER={pref}, aber kein Credential: weder {} gesetzt noch ein /login-Eintrag.",
+                kind.env_var()
+            )
+        })?;
+        return Ok(LlmClient::new(kind, secret, model_override));
+    }
 
-    let api_key = match kind {
-        ProviderKind::Anthropic => anthropic_key.unwrap(),
-        ProviderKind::OpenAi => openai_key.unwrap(),
-    };
+    for kind in ProviderKind::ALL {
+        if let Some(secret) = secret_for(kind) {
+            return Ok(LlmClient::new(kind, secret, model_override));
+        }
+    }
 
-    Ok(LlmClient::new(kind, api_key, read_env("ANVIL_MODEL")))
+    Err("Kein Credential gefunden. Melde dich mit /login <provider> an \
+         (oder setze z. B. OPENAI_API_KEY) und leg los."
+        .into())
+}
+
+/// Löst einen Provider-Bezeichner inkl. gängiger Aliase auf.
+fn resolve_provider(name: &str) -> Option<ProviderKind> {
+    let name = name.to_lowercase();
+    ProviderKind::from_id(&name).or(match name.as_str() {
+        "gemini" => Some(ProviderKind::Gemini),
+        "open-router" => Some(ProviderKind::OpenRouter),
+        _ => None,
+    })
+}
+
+/// Das Secret eines Providers: Env-Variable hat Vorrang, sonst die gespeicherte
+/// Auth. Bei OAuth wird (vorerst) das Access-Token genommen — der Refresh läuft
+/// über [`crate::oauth`], sobald ein konkreter Flow hinterlegt ist.
+pub fn secret_for(kind: ProviderKind) -> Option<String> {
+    if let Some(env) = read_env(kind.env_var()) {
+        return Some(env);
+    }
+    match auth::get(kind.id())? {
+        AuthInfo::Api { key } => Some(key),
+        AuthInfo::Oauth { access, .. } => Some(access),
+    }
+}
+
+/// Woher das Credential eines Providers stammt — für die Anzeige in `/login`.
+pub fn source_label(kind: ProviderKind) -> Option<&'static str> {
+    if read_env(kind.env_var()).is_some() {
+        return Some("env");
+    }
+    match auth::get(kind.id()) {
+        Some(AuthInfo::Api { .. }) => Some("gespeichert"),
+        Some(AuthInfo::Oauth { .. }) => Some("OAuth"),
+        None => None,
+    }
 }
 
 /// Liest eine Env-Variable, trimmt Whitespace und behandelt Leerstrings wie
