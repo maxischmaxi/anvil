@@ -35,6 +35,10 @@ pub enum AuthInfo {
         access: String,
         refresh: String,
         expires: u64,
+        /// ChatGPT/Codex Account/Org-ID aus dem OpenAI-ID-Token. Wird als
+        /// `ChatGPT-Account-Id` an den Subscription-Endpunkt gesendet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
     },
 }
 
@@ -123,6 +127,7 @@ mod tests {
             access: "a".into(),
             refresh: "r".into(),
             expires: 1_730_000_000_000,
+            account_id: Some("acct".into()),
         };
         let json = serde_json::to_string(&info).unwrap();
         let back: AuthInfo = serde_json::from_str(&json).unwrap();

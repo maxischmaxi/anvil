@@ -12,7 +12,9 @@ mod config;
 mod event;
 mod llm;
 mod oauth;
+mod openai_subscription;
 mod session;
+mod tokens;
 mod tools;
 mod ui;
 
@@ -27,12 +29,13 @@ use ratatui::crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event as TerminalEvent, EventStream,
 };
 use ratatui::crossterm::execute;
+use ratatui::crossterm::style::Print;
 use ratatui::crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport, layout::Rect};
 use tokio::sync::mpsc;
 
-use crate::app::App;
+use crate::app::{ActiveModel, App};
 use crate::event::{AgentCommand, AgentEvent};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -42,13 +45,7 @@ async fn main() -> Result<()> {
     // Provider aus den Umgebungsvariablen bestimmen. Fehlt der Key, läuft die App
     // trotzdem und zeigt den Hinweis als erste Scrollback-Zeile.
     let (client, intro) = match config::load() {
-        Ok(client) => {
-            let intro = format!(
-                "anvil bereit · {} · Enter sendet, Alt+Enter neue Zeile, Strg+C beendet.",
-                client.describe()
-            );
-            (Some(client), intro)
-        }
+        Ok(client) => (Some(client), String::new()),
         Err(reason) => (None, reason),
     };
 
@@ -67,19 +64,14 @@ fn setup_terminal() -> Result<Tui> {
     }));
 
     enable_raw_mode()?;
-    execute!(std::io::stdout(), EnableBracketedPaste)?;
-    // Kompaktes Fenster: obere Linie + bis zu fünf Eingabezeilen. So kann die
-    // Prompt-Eingabe bei langen Zeilen sichtbar umbrechen.
-    let rows = size().map(|(_, r)| r).unwrap_or(24);
-    let viewport_height = rows.clamp(2, 6);
-    let backend = CrosstermBackend::new(std::io::stdout());
-    let terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(viewport_height),
-        },
+    let viewport_height = initial_viewport_height();
+    execute!(
+        std::io::stdout(),
+        EnableBracketedPaste,
+        Clear(ClearType::All),
+        Clear(ClearType::Purge)
     )?;
-    Ok(terminal)
+    build_inline_terminal(viewport_height)
 }
 
 fn restore_terminal(terminal: &mut Tui) {
@@ -87,6 +79,85 @@ fn restore_terminal(terminal: &mut Tui) {
     let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
     let _ = Backend::flush(terminal.backend_mut());
     let _ = disable_raw_mode();
+}
+
+fn initial_viewport_height() -> u16 {
+    let rows = size().map(|(_, r)| r).unwrap_or(24);
+    rows.min(2)
+}
+
+fn build_inline_terminal(viewport_height: u16) -> Result<Tui> {
+    let rows = size().map(|(_, r)| r).unwrap_or(24);
+    let viewport_height = rows.min(viewport_height.max(1));
+    execute!(
+        std::io::stdout(),
+        MoveTo(0, rows.saturating_sub(viewport_height))
+    )?;
+    let backend = CrosstermBackend::new(std::io::stdout());
+    Ok(Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(viewport_height),
+        },
+    )?)
+}
+
+fn desired_viewport_height(app: &App) -> u16 {
+    let (cols, rows) = size().unwrap_or((80, 24));
+    let input_width = cols.saturating_sub(2).max(1) as usize;
+    let input_lines = visual_input_line_count(app, input_width) as u16;
+    let suggestions = if app.resume_picker_open() {
+        0
+    } else {
+        app.command_suggestions()
+            .len()
+            .min(5)
+            .min(rows.saturating_sub(2) as usize) as u16
+    };
+    let min_height = 2 + suggestions;
+    let max_height = rows.max(1);
+    (1 + suggestions + input_lines).clamp(min_height, max_height)
+}
+
+fn visual_input_line_count(app: &App, width: usize) -> usize {
+    let width = width.max(1);
+    let mut lines = 1usize;
+    let mut col = 0usize;
+
+    if app.masking() {
+        for _ in app.input.chars() {
+            if col == width {
+                lines += 1;
+                col = 0;
+            }
+            col += 1;
+        }
+        return lines;
+    }
+
+    for c in app.input.chars() {
+        if c == '\n' {
+            lines += 1;
+            col = 0;
+        } else {
+            if col == width {
+                lines += 1;
+                col = 0;
+            }
+            col += 1;
+        }
+    }
+    lines
+}
+
+fn rebuild_terminal_for_viewport(terminal: &mut Tui, height: u16) -> Result<()> {
+    execute!(
+        terminal.backend_mut(),
+        Clear(ClearType::All),
+        Clear(ClearType::Purge)
+    )?;
+    *terminal = build_inline_terminal(height)?;
+    Ok(())
 }
 
 async fn run(terminal: &mut Tui, client: Option<llm::LlmClient>, intro: String) -> Result<()> {
@@ -97,10 +168,14 @@ async fn run(terminal: &mut Tui, client: Option<llm::LlmClient>, intro: String) 
 
     // Aktiven Provider/Modell festhalten, bevor der Client in den Task wandert,
     // damit /models das gerade laufende Modell markieren kann.
-    let active = client.as_ref().map(|c| (c.kind(), c.model().to_string()));
+    let active = client.as_ref().map(|c| {
+        ActiveModel::new(c.kind(), c.model().to_string(), c.auth_mode())
+    });
     tokio::spawn(agent::run(client, command_rx, cancel_rx, event_tx));
 
     let mut app = App::new(command_tx, cancel_tx, intro, active);
+    let mut picker_was_open = false;
+    let mut viewport_height = initial_viewport_height();
     let mut terminal_events = EventStream::new();
     // Periodischer Tick, damit der Spinner animiert (und der Viewport frisch bleibt).
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
@@ -109,6 +184,14 @@ async fn run(terminal: &mut Tui, client: Option<llm::LlmClient>, intro: String) 
     terminal.draw(|frame| ui::render_viewport(frame, &app))?;
 
     while !app.should_quit {
+        let picker_open = app.resume_picker_open();
+        if picker_open && !picker_was_open {
+            clear_terminal(terminal)?;
+        } else if !picker_open && picker_was_open {
+            app.request_reflow();
+        }
+        picker_was_open = picker_open;
+
         if app.take_clear_requested() {
             clear_terminal(terminal)?;
         }
@@ -116,8 +199,19 @@ async fn run(terminal: &mut Tui, client: Option<llm::LlmClient>, intro: String) 
             reflow_terminal(terminal, messages)?;
         }
 
-        flush_scrollback(terminal, &mut app)?;
-        terminal.draw(|frame| ui::render_viewport(frame, &app))?;
+        let wanted_height = desired_viewport_height(&app);
+        if wanted_height != viewport_height {
+            viewport_height = wanted_height;
+            rebuild_terminal_for_viewport(terminal, viewport_height)?;
+        }
+
+        if app.resume_picker_open() {
+            render_picker_screen(terminal, &app)?;
+            terminal.draw(|frame| ui::render_viewport(frame, &app))?;
+        } else {
+            flush_scrollback(terminal, &mut app)?;
+            terminal.draw(|frame| ui::render_viewport(frame, &app))?;
+        }
 
         tokio::select! {
             _ = ticker.tick() => app.tick(),
@@ -138,6 +232,26 @@ async fn run(terminal: &mut Tui, client: Option<llm::LlmClient>, intro: String) 
 
     // Verbleibende fertige Blöcke noch in den Scrollback schreiben.
     flush_scrollback(terminal, &mut app)?;
+    Ok(())
+}
+
+fn render_picker_screen(terminal: &mut Tui, app: &App) -> Result<()> {
+    let (width, height) = size()?;
+    let lines = ui::picker_lines(app, width, height.saturating_sub(2));
+    execute!(
+        terminal.backend_mut(),
+        MoveTo(0, 0),
+        Clear(ClearType::All),
+        Clear(ClearType::Purge)
+    )?;
+    terminal.clear()?;
+    for (index, line) in lines.into_iter().enumerate() {
+        execute!(
+            terminal.backend_mut(),
+            MoveTo(0, index as u16),
+            Print(line)
+        )?;
+    }
     Ok(())
 }
 

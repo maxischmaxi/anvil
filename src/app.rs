@@ -4,7 +4,7 @@
 //! Events (Tastatur, Agent) rein und aktualisiert seinen Zustand. Das Rendern
 //! lebt in [`crate::ui`], das Senden an den Agent geht über einen Kanal.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc::UnboundedSender;
@@ -12,8 +12,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::auth::{self, AuthInfo};
 use crate::config;
 use crate::event::{AgentCommand, AgentEvent};
-use crate::llm::{ChatMessage, ProviderKind, Secret, ToolResult};
-use crate::session::{self, SessionId};
+use crate::llm::{AuthMode, ChatMessage, ProviderKind, Secret, ToolCall, ToolResult};
+use crate::session::{self, SessionId, SessionMeta};
+use crate::tokens::TokenStats;
 
 /// Wer eine Nachricht im Verlauf geschrieben hat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,33 @@ impl Message {
     }
 }
 
+/// Welcher Provider/Modell/Credential-Modus gerade aktiv ist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveModel {
+    pub kind: ProviderKind,
+    pub model: String,
+    pub auth_mode: AuthMode,
+}
+
+impl ActiveModel {
+    pub fn new(kind: ProviderKind, model: String, auth_mode: AuthMode) -> Self {
+        Self {
+            kind,
+            model,
+            auth_mode,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        format!(
+            "{} · {} · {}",
+            self.kind.display(),
+            self.model,
+            self.auth_mode.indicator()
+        )
+    }
+}
+
 /// Ob der Agent gerade arbeitet — steuert die Statuszeile und blockiert das
 /// Absenden eines zweiten Prompts, solange noch einer läuft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +84,34 @@ pub enum Status {
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LARGE_PASTE_LINE_THRESHOLD: usize = 8;
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1_200;
+
+#[derive(Debug, Clone, Copy)]
+pub struct CommandSuggestion {
+    pub name: &'static str,
+    pub hint: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct ResumePicker {
+    sessions: Vec<SessionMeta>,
+    selected: usize,
+}
+
+const COMMANDS: &[CommandSuggestion] = &[
+    CommandSuggestion { name: "login", hint: "Provider anmelden" },
+    CommandSuggestion { name: "resume", hint: "Sitzung auswählen/fortsetzen" },
+    CommandSuggestion { name: "new", hint: "neue Sitzung starten" },
+    CommandSuggestion { name: "compact", hint: "Kontext verdichten" },
+    CommandSuggestion { name: "clear", hint: "UI + Sitzung leeren" },
+    CommandSuggestion { name: "models", hint: "Modelle anzeigen/wechseln" },
+    CommandSuggestion { name: "logout", hint: "Provider abmelden" },
+    CommandSuggestion { name: "help", hint: "Hilfe anzeigen" },
+    CommandSuggestion { name: "open", hint: "Alias für resume" },
+    CommandSuggestion { name: "model", hint: "Alias für models" },
+    CommandSuggestion { name: "auth", hint: "Alias für login" },
+    CommandSuggestion { name: "cls", hint: "Alias für clear" },
+    CommandSuggestion { name: "?", hint: "Alias für help" },
+];
 
 /// Der komplette Anwendungszustand.
 pub struct App {
@@ -76,12 +132,12 @@ pub struct App {
     /// Fertige Blöcke, die der Haupt-Loop per `insert_before` in den echten
     /// Terminal-Scrollback schiebt (und dann leert).
     scrollback: Vec<Message>,
-    /// Zuletzt per `/sessions` angezeigte Sitzungen (Reihenfolge = Nummerierung),
-    /// damit `/resume <n>` die richtige id auflösen kann.
-    session_list: Vec<SessionId>,
-    /// Aktiver Provider + Modell (für die Statuszeile und die `●`-Markierung in
-    /// `/models`). `None`, solange kein Credential vorliegt.
-    active: Option<(ProviderKind, String)>,
+    /// Aktuell geöffnete Resume-Auswahl. Pfeiltasten bewegen die Auswahl,
+    /// Enter lädt die markierte Sitzung.
+    resume_picker: Option<ResumePicker>,
+    /// Aktiver Provider + Modell + Credential-Modus (für die Statuszeile und die
+    /// `●`-Markierung in `/models`). `None`, solange kein Credential vorliegt.
+    active: Option<ActiveModel>,
     /// Zuletzt per `/models` angezeigte Provider/Modell-Kombis (Nummerierung für
     /// `/models <n>`).
     model_list: Vec<(ProviderKind, String)>,
@@ -93,10 +149,14 @@ pub struct App {
     clear_requested: bool,
     /// Einmaliges Signal an den Haupt-Loop, die gesamte History neu zu rendern.
     reflow_requested: bool,
+    /// Index innerhalb der aktuell gefilterten Slash-Command-Vorschläge.
+    suggestion_index: usize,
     /// Kanal zum Agent-Task (Prompts/Antworten).
     commands: UnboundedSender<AgentCommand>,
     /// Separater Kanal, um einen laufenden Turn abzubrechen.
     cancel: UnboundedSender<()>,
+    token_stats: TokenStats,
+    last_activity: Option<SystemTime>,
 }
 
 impl App {
@@ -104,8 +164,14 @@ impl App {
         commands: UnboundedSender<AgentCommand>,
         cancel: UnboundedSender<()>,
         intro: String,
-        active: Option<(ProviderKind, String)>,
+        active: Option<ActiveModel>,
     ) -> Self {
+        let scrollback = if intro.is_empty() {
+            Vec::new()
+        } else {
+            vec![Message::new(Role::System, intro)]
+        };
+
         Self {
             input: String::new(),
             cursor: 0,
@@ -114,15 +180,18 @@ impl App {
             spinner_frame: 0,
             pending: None,
             transcript: Vec::new(),
-            scrollback: vec![Message::new(Role::System, intro)],
-            session_list: Vec::new(),
+            scrollback,
+            resume_picker: None,
             active,
             model_list: Vec::new(),
             secret_entry: None,
             clear_requested: false,
             reflow_requested: false,
+            suggestion_index: 0,
             commands,
             cancel,
+            token_stats: TokenStats::default(),
+            last_activity: None,
         }
     }
 
@@ -131,11 +200,94 @@ impl App {
         self.secret_entry.is_some()
     }
 
-    /// Label des aktiven Modells für die Statuszeile, z. B. `"OpenAI · gpt-5.5"`.
+    pub fn command_suggestions(&self) -> Vec<CommandSuggestion> {
+        command_suggestions_for(&self.input, self.cursor)
+    }
+
+    pub fn selected_suggestion_index(&self) -> usize {
+        let count = self.command_suggestions().len();
+        if count == 0 {
+            0
+        } else {
+            self.suggestion_index.min(count - 1)
+        }
+    }
+
+    pub fn resume_picker_open(&self) -> bool {
+        self.resume_picker.is_some()
+    }
+
+    pub fn resume_picker_rows(&self) -> Option<Vec<(bool, String, String)>> {
+        let picker = self.resume_picker.as_ref()?;
+        Some(
+            picker
+                .sessions
+                .iter()
+                .enumerate()
+                .map(|(index, meta)| {
+                    (
+                        index == picker.selected,
+                        meta.title.clone(),
+                        relative_time(meta.modified),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn reset_suggestion_index(&mut self) {
+        let count = self.command_suggestions().len();
+        if count == 0 {
+            self.suggestion_index = 0;
+        } else if self.suggestion_index >= count {
+            self.suggestion_index = count - 1;
+        }
+    }
+
+    fn move_suggestion(&mut self, delta: isize) -> bool {
+        let count = self.command_suggestions().len();
+        if count == 0 {
+            self.suggestion_index = 0;
+            return false;
+        }
+        self.suggestion_index = if delta < 0 {
+            self.suggestion_index.saturating_sub(delta.unsigned_abs())
+        } else {
+            (self.suggestion_index + delta as usize).min(count - 1)
+        };
+        true
+    }
+
+    fn accept_suggestion(&mut self) -> bool {
+        let suggestions = self.command_suggestions();
+        let Some(suggestion) = suggestions.get(self.selected_suggestion_index()) else {
+            return false;
+        };
+        let replacement = format!("/{} ", suggestion.name);
+        if self.input.len() == self.cursor {
+            self.input = replacement;
+            self.cursor = self.input.len();
+            return true;
+        }
+        false
+    }
+
+    /// Label des aktiven Modells für die Statuszeile, z. B.
+    /// `"OpenAI · gpt-5.5 · ◉ Subscription"`.
     pub fn active_label(&self) -> Option<String> {
-        self.active
-            .as_ref()
-            .map(|(kind, model)| format!("{} · {}", kind.display(), model))
+        self.active.as_ref().map(ActiveModel::label)
+    }
+
+    pub fn token_stats(&self) -> TokenStats {
+        self.token_stats
+    }
+
+    pub fn stalled_hint(&self) -> bool {
+        matches!(self.status, Status::Thinking)
+            && self
+                .last_activity
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|elapsed| elapsed > Duration::from_secs(90))
     }
 
     // ---- Eingabe-Bearbeitung (Unicode-sicher über Byte-Offsets) ----
@@ -297,6 +449,9 @@ impl App {
             return;
         }
 
+        if self.resume_picker.is_some() {
+            return;
+        }
         let text = self.input.trim().to_string();
         if text.is_empty() {
             return;
@@ -317,6 +472,7 @@ impl App {
         // Viewport und wird committed, wenn sie fertig ist.
         self.scrollback.push(Message::new(Role::User, text.clone()));
         self.status = Status::Thinking;
+        self.last_activity = Some(SystemTime::now());
         self.input.clear();
         self.cursor = 0;
         let _ = self.commands.send(AgentCommand::Prompt(text));
@@ -331,9 +487,9 @@ impl App {
         // Rest der Zeile (für /login <provider> [key|oauth]).
         let rest = command[name.len()..].trim();
         match name {
-            "sessions" | "ls" | "list" => self.cmd_sessions(),
-            "resume" | "open" => self.cmd_resume(arg),
+            "resume" | "open" => self.cmd_resume(),
             "new" => self.cmd_new(),
+            "compact" => self.cmd_compact(),
             "clear" | "cls" => self.cmd_clear(),
             "models" | "model" => self.cmd_models(arg),
             "login" | "auth" => self.cmd_login(rest),
@@ -345,37 +501,24 @@ impl App {
         }
     }
 
-    fn cmd_sessions(&mut self) {
+    fn cmd_resume(&mut self) {
         let sessions = session::list();
-        self.session_list = sessions.iter().map(|s| s.id.clone()).collect();
-
         if sessions.is_empty() {
             self.note("Noch keine gespeicherten Sitzungen.".to_string());
             return;
         }
-
-        let mut text = String::from("Sitzungen (neueste zuerst):\n");
-        for (index, meta) in sessions.iter().enumerate() {
-            text.push_str(&format!(
-                "  {:>2}  {}  ·  {}\n",
-                index + 1,
-                meta.title,
-                relative_time(meta.modified),
-            ));
-        }
-        text.push_str("\n/resume <n> zum Fortsetzen · /new für eine neue");
-        self.note(text);
+        self.resume_picker = Some(ResumePicker {
+            sessions,
+            selected: 0,
+        });
+        self.input = "/resume".to_string();
+        self.cursor = self.input.len();
     }
 
-    fn cmd_resume(&mut self, arg: Option<&str>) {
-        let Some(number) = arg.and_then(|s| s.parse::<usize>().ok()) else {
-            self.note("Nutzung: /resume <nummer> — erst /sessions ausführen.".to_string());
-            return;
-        };
-        let Some(id) = self.session_list.get(number.wrapping_sub(1)).cloned() else {
-            self.note("Keine Sitzung mit dieser Nummer. Erst /sessions ausführen.".to_string());
-            return;
-        };
+    fn load_session(&mut self, id: SessionId) {
+        self.resume_picker = None;
+        self.input.clear();
+        self.cursor = 0;
 
         match session::load(&id) {
             Ok(history) => {
@@ -390,9 +533,61 @@ impl App {
         }
     }
 
+    fn move_resume_selection(&mut self, delta: isize) -> bool {
+        let Some(picker) = &mut self.resume_picker else {
+            return false;
+        };
+        if picker.sessions.is_empty() {
+            picker.selected = 0;
+            return true;
+        }
+        picker.selected = if delta < 0 {
+            picker.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            (picker.selected + delta as usize).min(picker.sessions.len() - 1)
+        };
+        true
+    }
+
+    fn accept_resume_selection(&mut self) -> bool {
+        let Some(picker) = &self.resume_picker else {
+            return false;
+        };
+        let Some(meta) = picker.sessions.get(picker.selected) else {
+            return false;
+        };
+        self.load_session(meta.id.clone());
+        true
+    }
+
+    fn cancel_resume_selection(&mut self) -> bool {
+        if self.resume_picker.take().is_some() {
+            self.input.clear();
+            self.cursor = 0;
+            return true;
+        }
+        false
+    }
+
     fn cmd_new(&mut self) {
         let _ = self.commands.send(AgentCommand::Reset);
+        self.input.clear();
+        self.cursor = 0;
+        self.status = Status::Idle;
+        self.pending = None;
+        self.transcript.clear();
+        self.scrollback.clear();
+        self.resume_picker = None;
+        self.clear_requested = true;
+        self.reflow_requested = false;
         self.note("Neue Sitzung gestartet.".to_string());
+    }
+
+    fn cmd_compact(&mut self) {
+        self.status = Status::Thinking;
+        self.last_activity = Some(SystemTime::now());
+        self.note("Verdichte Kontext…".to_string());
+        let _ = self.commands.send(AgentCommand::Compact);
     }
 
     fn cmd_clear(&mut self) {
@@ -403,7 +598,7 @@ impl App {
         self.pending = None;
         self.transcript.clear();
         self.scrollback.clear();
-        self.session_list.clear();
+        self.resume_picker = None;
         self.clear_requested = true;
         self.reflow_requested = false;
     }
@@ -416,7 +611,9 @@ impl App {
             return;
         }
         self.model_list.clear();
-        let mut text = String::from("Modelle (● = aktiv) — /models <n> zum Wechseln:\n");
+        let mut text = String::from(
+            "Modelle (● = aktiv, [key]/[sub] = Credential-Schiene) — /models <n> zum Wechseln:\n",
+        );
         for kind in ProviderKind::ALL {
             if config::secret_for(kind).is_some() {
                 for model in kind.models() {
@@ -425,9 +622,15 @@ impl App {
                     let active = self
                         .active
                         .as_ref()
-                        .is_some_and(|(k, m)| *k == kind && m == model);
+                        .is_some_and(|active| active.kind == kind && active.model == *model);
                     let mark = if active { "●" } else { " " };
-                    text.push_str(&format!("  {n:>2}  {mark} {} · {model}\n", kind.display()));
+                    let mode = config::auth_mode_for_provider(kind)
+                        .map(|mode| mode.short_indicator())
+                        .unwrap_or("?");
+                    text.push_str(&format!(
+                        "  {n:>2}  {mark} [{mode}] {} · {model}\n",
+                        kind.display()
+                    ));
                 }
             } else {
                 text.push_str(&format!(
@@ -465,13 +668,17 @@ impl App {
             ));
             return;
         };
+        let auth_info = config::auth_info_for(kind);
+        let auth_mode = config::auth_mode_for_provider(kind).unwrap_or(AuthMode::ApiKey);
         let _ = self.commands.send(AgentCommand::SetClient {
             kind,
             model: model.clone(),
             secret: Secret(secret),
+            auth_info,
         });
-        self.note(format!("Aktiv: {} · {model}", kind.display()));
-        self.active = Some((kind, model));
+        let active = ActiveModel::new(kind, model, auth_mode);
+        self.note(format!("Aktiv: {}", active.label()));
+        self.active = Some(active);
     }
 
     // ---- /login + /logout ----
@@ -533,14 +740,21 @@ impl App {
 
     fn cmd_login_oauth(&mut self, kind: ProviderKind) {
         if kind.supports_oauth() {
-            // Seam: hier liefe der echte PKCE-Flow über crate::oauth.
-            self.note(format!("OAuth-Flow für {} ist noch nicht verdrahtet.", kind.display()));
+            self.note(
+                "OpenAI-Subscription-Login gestartet. Falls der Browser nicht aufgeht: \
+                 öffne die angezeigte Auth-Seite manuell. Nach Erfolg ist OpenAI aktiv."
+                    .to_string(),
+            );
+            self.status = Status::Thinking;
+            self.active = Some(ActiveModel::new(
+                kind,
+                kind.default_model().to_string(),
+                AuthMode::OpenAiSubscription,
+            ));
+            let _ = self.commands.send(AgentCommand::LoginOauth { kind });
         } else {
             self.note(format!(
-                "Für {} ist bewusst kein Subscription-/OAuth-Login hinterlegt — das würde in \
-                 einem Drittanbieter-Agenten gegen die AGB des Anbieters verstoßen (genau wie bei \
-                 Anthropic). Das PKCE-Gerüst liegt in src/oauth.rs bereit; wer einen erlaubten \
-                 Flow hat, hängt dort eine OAuthConfig ein. Bis dahin: /login {} mit API-Key.",
+                "Für {} ist kein OAuth-/Subscription-Login verfügbar. Nutze /login {} mit API-Key.",
                 kind.display(),
                 kind.id()
             ));
@@ -580,14 +794,14 @@ impl App {
     fn cmd_help(&mut self) {
         self.note(
             "Befehle:\n  \
-             /sessions      gespeicherte Sitzungen auflisten\n  \
-             /resume <n>    Sitzung n fortsetzen\n  \
-             /new           neue Sitzung beginnen\n  \
-             /clear         neue blanke Sitzung + UI löschen\n  \
-             /models [n]    Modelle anzeigen / Provider+Modell wechseln\n  \
-             /login [prov]  Provider anmelden (API-Key, maskiert)\n  \
+             /resume       Sitzungen auswählen/fortsetzen (↑/↓, Enter)\n  \
+             /new          neue Sitzung beginnen\n  \
+             /compact      Kontext wie opencode verdichten\n  \
+             /clear        neue blanke Sitzung + UI löschen\n  \
+             /models [n]   Modelle anzeigen / Provider+Modell wechseln\n  \
+             /login [prov] Provider anmelden (API-Key, maskiert)\n  \
              /logout <prov> gespeicherten Key entfernen\n  \
-             /help          diese Hilfe"
+             /help         diese Hilfe"
                 .to_string(),
         );
     }
@@ -600,6 +814,9 @@ impl App {
     /// Esc: läuft ein Turn, wird er abgebrochen; sonst wird die Eingabe geleert.
     /// (Beenden geht über Strg+C.)
     fn on_escape(&mut self) {
+        if self.cancel_resume_selection() {
+            return;
+        }
         if self.secret_entry.take().is_some() {
             self.input.clear();
             self.cursor = 0;
@@ -634,6 +851,14 @@ impl App {
             // Steuerung
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Esc => self.on_escape(),
+            KeyCode::Up if self.move_resume_selection(-1) => {}
+            KeyCode::Down if self.move_resume_selection(1) => {}
+            KeyCode::Enter if self.accept_resume_selection() => {}
+            KeyCode::Tab if !ctrl && !alt => {
+                self.accept_suggestion();
+            }
+            KeyCode::Up if self.move_suggestion(-1) => {}
+            KeyCode::Down if self.move_suggestion(1) => {}
             // Alt+Enter / Shift+Enter: neue Zeile; Enter: absenden.
             KeyCode::Enter if alt || shift => self.insert_char('\n'),
             KeyCode::Enter => self.submit(),
@@ -673,6 +898,7 @@ impl App {
             KeyCode::Char(c) if !ctrl && !alt => self.insert_char(c),
             _ => {}
         }
+        self.reset_suggestion_index();
     }
 
     /// Reagiert auf eingefügten Text. Kleine Pastes landen unverändert in der
@@ -695,8 +921,21 @@ impl App {
 
     /// Reagiert auf eine Meldung des Agent-Tasks.
     pub fn on_agent_event(&mut self, event: AgentEvent) {
+        self.last_activity = Some(SystemTime::now());
         match event {
             AgentEvent::Chunk(text) => self.append_assistant(&text),
+            AgentEvent::TokenStats(stats) => self.token_stats = stats,
+            AgentEvent::CompactStarted => {
+                self.commit_pending();
+                self.pending = Some(Message::new(Role::System, "Verdichte Kontext…"));
+            }
+            AgentEvent::Compacted { summary, recent } => {
+                self.commit_pending();
+                self.note(format!(
+                    "Kontext verdichtet.\n\n{summary}\n\nRecent erhalten: {} Tokens (geschätzt).",
+                    crate::tokens::estimate_text(&recent)
+                ));
+            }
             AgentEvent::ToolStarted(title) => {
                 // Vorherigen Block (z. B. Assistenten-Text) abschließen, dann das
                 // laufende Tool als neuen pending-Block live im Viewport zeigen.
@@ -804,6 +1043,21 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+fn command_suggestions_for(input: &str, cursor: usize) -> Vec<CommandSuggestion> {
+    if cursor != input.len() || !input.starts_with('/') || input.contains('\n') {
+        return Vec::new();
+    }
+    let typed = &input[1..];
+    if typed.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    COMMANDS
+        .iter()
+        .copied()
+        .filter(|command| command.name.starts_with(typed))
+        .collect()
+}
+
 /// Provider aus einem `/login`/`/logout`-Argument auflösen (inkl. Alias `gemini`).
 fn provider_from_arg(id: &str) -> Option<ProviderKind> {
     ProviderKind::from_id(id).or(match id {
@@ -831,20 +1085,7 @@ fn history_to_display(history: &[ChatMessage]) -> Vec<Message> {
                 }
                 pending_tools = tool_calls
                     .iter()
-                    .map(|call| {
-                        let detail = call
-                            .arguments
-                            .get("command")
-                            .or_else(|| call.arguments.get("path"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let title = if detail.is_empty() {
-                            call.name.clone()
-                        } else {
-                            format!("{} · {}", call.name, detail)
-                        };
-                        Message::new(Role::Tool, title)
-                    })
+                    .map(|call| Message::new(Role::Tool, tool_title(call)))
                     .collect();
             }
             ChatMessage::ToolResults(results) => {
@@ -857,12 +1098,47 @@ fn history_to_display(history: &[ChatMessage]) -> Vec<Message> {
     out
 }
 
+/// Kopf-/Befehlszeile eines Tool-Blocks. `bash` bekommt den **vollständigen**
+/// Befehl in den Body (mehrzeilig möglich, Kopfzeile nur `bash`), passend zu
+/// [`crate::agent`]; andere Tools die Kurzform `name · pfad`.
+fn tool_title(call: &ToolCall) -> String {
+    if call.name == "bash" {
+        let command = call
+            .arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return format!("bash\n{command}");
+    }
+    let detail = call
+        .arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if detail.is_empty() {
+        call.name.clone()
+    } else {
+        format!("{} · {}", call.name, detail)
+    }
+}
+
+/// Ob eine Tool-Nachricht ihre vollständige Ausgabe im UI-Block behalten soll.
+fn keeps_full_tool_output(content: &str) -> bool {
+    matches!(content.split('\n').next(), Some("bash") | Some("read_file"))
+}
+
 fn attach_tool_results(messages: &mut [Message], results: &[ToolResult]) {
     for (message, result) in messages.iter_mut().zip(results) {
         let mark = if result.is_error { "✗" } else { "→" };
-        message
-            .content
-            .push_str(&format!("\n  {mark} {}", summarize_tool_result(&result.content)));
+        // bash/read_file zeigen die vollständige Ausgabe (gekürzt erst beim Rendern),
+        // damit fortgesetzte Sessions denselben Block liefern wie der Live-Lauf;
+        // andere Tools nur die kompakte Zusammenfassung.
+        let body = if keeps_full_tool_output(&message.content) {
+            result.content.clone()
+        } else {
+            summarize_tool_result(&result.content)
+        };
+        message.content.push_str(&format!("\n  {mark} {body}"));
     }
 }
 
@@ -1000,6 +1276,34 @@ mod tests {
         let mut app = app_with("ab", 2);
         app.transpose();
         assert_eq!(app.input, "ba");
+    }
+
+    #[test]
+    fn slash_commands_are_suggested_and_accepted_with_tab() {
+        let mut app = app_with("/lo", 3);
+        let suggestions = app.command_suggestions();
+        assert!(suggestions.iter().any(|s| s.name == "login"));
+        assert!(suggestions.iter().any(|s| s.name == "logout"));
+        app.accept_suggestion();
+        assert_eq!(app.input, "/login ");
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn suggestions_are_only_for_command_prefix_at_end() {
+        assert!(app_with("hello /lo", 9).command_suggestions().is_empty());
+        assert!(app_with("/login openai", 13).command_suggestions().is_empty());
+        assert!(app_with("/login", 2).command_suggestions().is_empty());
+    }
+
+    #[test]
+    fn arrow_keys_select_suggestions() {
+        let mut app = app_with("/lo", 3);
+        assert_eq!(app.selected_suggestion_index(), 0);
+        assert!(app.move_suggestion(1));
+        assert_eq!(app.selected_suggestion_index(), 1);
+        app.accept_suggestion();
+        assert_eq!(app.input, "/logout ");
     }
 
     #[test]

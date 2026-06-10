@@ -13,6 +13,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::auth::AuthInfo;
+use crate::openai_subscription;
+
 /// Default-Modelle (Stand Mai 2026). Per `/models` oder `ANVIL_MODEL` wählbar.
 pub const ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 pub const OPENAI_MODEL: &str = "gpt-5.5";
@@ -79,6 +82,7 @@ pub struct AssistantTurn {
 enum Wire {
     OpenAiCompatible,
     Anthropic,
+    OpenAiSubscription,
 }
 
 /// Welcher Anbieter angesprochen wird. Trägt zugleich den kleinen Provider-
@@ -149,7 +153,13 @@ impl ProviderKind {
     pub fn models(self) -> &'static [&'static str] {
         match self {
             ProviderKind::Anthropic => &["claude-sonnet-4-6", "claude-opus-4-1"],
-            ProviderKind::OpenAi => &["gpt-5.5", "gpt-5.5-mini"],
+            ProviderKind::OpenAi => &[
+                "gpt-5.5",
+                "gpt-5.5-mini",
+                "gpt-5.1-codex",
+                "gpt-5.1-codex-mini",
+                "gpt-5.2",
+            ],
             ProviderKind::Gemini => &["gemini-2.5-pro", "gemini-2.5-flash"],
             ProviderKind::OpenRouter => &[
                 "openai/gpt-5.5",
@@ -180,13 +190,9 @@ impl ProviderKind {
         }
     }
 
-    /// Ob für diesen Provider ein **erlaubter** OAuth-Flow hinterlegt ist. Bewusst
-    /// für alle `false`: ein Subscription-Login (ChatGPT/Gemini/Claude) in einem
-    /// Drittanbieter-Agenten würde die jeweiligen AGB verletzen. Die OAuth-
-    /// Maschinerie in [`crate::oauth`] existiert als Gerüst — wer einen legitimen
-    /// Flow hat, hinterlegt hier eine `oauth::OAuthConfig`.
+    /// Ob für diesen Provider ein OAuth-/Subscription-Flow in anvil verdrahtet ist.
     pub fn supports_oauth(self) -> bool {
-        false
+        matches!(self, ProviderKind::OpenAi)
     }
 }
 
@@ -201,6 +207,31 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// Welche Credential-Schiene der aktive Client tatsächlich verwendet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    /// Provider-API-Key (aus Env oder gespeicherter `auth.json`).
+    ApiKey,
+    /// OpenAI OAuth-/ChatGPT-Subscription-Token.
+    OpenAiSubscription,
+}
+
+impl AuthMode {
+    pub fn indicator(self) -> &'static str {
+        match self {
+            AuthMode::ApiKey => "🔑 API-Key",
+            AuthMode::OpenAiSubscription => "◉ Subscription",
+        }
+    }
+
+    pub fn short_indicator(self) -> &'static str {
+        match self {
+            AuthMode::ApiKey => "key",
+            AuthMode::OpenAiSubscription => "sub",
+        }
+    }
+}
+
 /// Ein für einen Provider konfigurierter Client.
 pub struct LlmClient {
     kind: ProviderKind,
@@ -210,17 +241,34 @@ pub struct LlmClient {
     secret: String,
     model: String,
     base_url: String,
+    auth_info: Option<AuthInfo>,
 }
-
 impl LlmClient {
-    pub fn new(kind: ProviderKind, secret: String, model_override: Option<String>) -> Self {
+    pub fn with_auth(
+        kind: ProviderKind,
+        secret: String,
+        model_override: Option<String>,
+        auth_info: Option<AuthInfo>,
+    ) -> Self {
         let model = model_override.unwrap_or_else(|| kind.default_model().to_string());
+        let subscription = kind == ProviderKind::OpenAi && matches!(auth_info, Some(AuthInfo::Oauth { .. }));
+        let http = if subscription {
+            // Der ChatGPT/Codex-SSE-Stream ist mit HTTP/2 gelegentlich anfällig
+            // für Body-Decoding/Transport-Abbrüche. HTTP/1.1 ist für SSE stabiler.
+            reqwest::Client::builder()
+                .http1_only()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        } else {
+            reqwest::Client::new()
+        };
         Self {
             kind,
-            http: reqwest::Client::new(),
+            http,
             secret,
             model,
             base_url: kind.base_url().to_string(),
+            auth_info,
         }
     }
 
@@ -232,23 +280,56 @@ impl LlmClient {
         &self.model
     }
 
+    pub fn auth_mode(&self) -> AuthMode {
+        auth_mode_for(self.kind, self.auth_info.as_ref())
+    }
+
     /// Menschenlesbare Beschreibung für die Statuszeile, z. B.
-    /// `"OpenAI (gpt-5.5)"`.
+    /// `"OpenAI (gpt-5.5, ◉ Subscription)"`.
     pub fn describe(&self) -> String {
-        format!("{} ({})", self.kind.display(), self.model)
+        format!(
+            "{} ({}, {})",
+            self.kind.display(),
+            self.model,
+            self.auth_mode().indicator()
+        )
+    }
+
+    fn wire(&self) -> Wire {
+        if self.kind == ProviderKind::OpenAi && matches!(self.auth_info, Some(AuthInfo::Oauth { .. })) {
+            Wire::OpenAiSubscription
+        } else {
+            self.kind.wire()
+        }
+    }
+
+    async fn refresh_subscription_token_if_needed(&mut self) -> Result<()> {
+        if self.kind != ProviderKind::OpenAi {
+            return Ok(());
+        }
+        let Some(auth_info) = self.auth_info.take() else {
+            return Ok(());
+        };
+        let refreshed = openai_subscription::refresh_if_needed(auth_info).await?;
+        if let AuthInfo::Oauth { access, .. } = &refreshed {
+            self.secret = access.clone();
+        }
+        self.auth_info = Some(refreshed);
+        Ok(())
     }
 
     /// Streamt eine Antwort des Modells. Text-Deltas werden live über `on_text`
     /// gemeldet (für die UI); zurückgegeben wird der vollständige Turn inklusive
     /// aller Tool-Aufrufe, die der Aufrufer dann ausführt.
     pub async fn stream(
-        &self,
+        &mut self,
         system: Option<&str>,
         messages: &[ChatMessage],
         tools: &[ToolSpec],
         on_text: &mut (dyn FnMut(String) + Send),
     ) -> Result<AssistantTurn> {
-        match self.kind.wire() {
+        self.refresh_subscription_token_if_needed().await?;
+        match self.wire() {
             Wire::Anthropic => {
                 anthropic::stream(
                     &self.http,
@@ -274,6 +355,31 @@ impl LlmClient {
                 )
                 .await
             }
+            Wire::OpenAiSubscription => {
+                let account_id = match &self.auth_info {
+                    Some(AuthInfo::Oauth { account_id, .. }) => account_id.as_deref(),
+                    _ => None,
+                };
+                openai_subscription::stream(
+                    &self.http,
+                    &self.secret,
+                    account_id,
+                    &self.model,
+                    system,
+                    messages,
+                    tools,
+                    on_text,
+                )
+                .await
+            }
         }
+    }
+}
+
+pub fn auth_mode_for(kind: ProviderKind, auth_info: Option<&AuthInfo>) -> AuthMode {
+    if kind == ProviderKind::OpenAi && matches!(auth_info, Some(AuthInfo::Oauth { .. })) {
+        AuthMode::OpenAiSubscription
+    } else {
+        AuthMode::ApiKey
     }
 }

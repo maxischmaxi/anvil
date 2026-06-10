@@ -11,13 +11,13 @@
 
 use ratatui::{
     Frame,
-    layout::Position,
+    layout::{Position, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
 };
 
-use crate::app::{App, Message, Role, Status};
+use crate::app::{App, CommandSuggestion, Message, Role, Status};
 
 /// Breite des Eingabe-Indikators `"❯ "` bzw. der Einrückung `"  "` in Spalten.
 const PROMPT_WIDTH: u16 = 2;
@@ -43,6 +43,16 @@ pub fn message_lines(message: &Message, width: u16) -> Vec<Line<'static>> {
 }
 
 fn tool_message_lines(content: &str, width: usize) -> Vec<Line<'static>> {
+    // bash und read_file werden eigens gerendert: vollständiger Aufruf +
+    // vollständiges Ergebnis, visuell gerahmt und erst beim Rendern gekürzt.
+    let head = content.split('\n').next().map(str::trim);
+    if head == Some("bash") {
+        return bash_message_lines(content, width);
+    }
+    if head.is_some_and(|line| line == "read_file" || line.starts_with("read_file · ")) {
+        return read_file_message_lines(content, width);
+    }
+
     let mut raw = content.lines();
     let head = raw.next().unwrap_or("").trim();
     let (name, detail) = head.split_once(" · ").unwrap_or((head, ""));
@@ -57,6 +67,39 @@ fn tool_message_lines(content: &str, width: usize) -> Vec<Line<'static>> {
         Span::styled("⚙ ", tool),
         Span::styled(name.to_string(), tool),
     ])];
+
+    if name == "edit_file" {
+        if !detail.is_empty() {
+            lines[0].spans.push(Span::styled("  ", border));
+            lines[0].spans.push(Span::styled(detail.to_string(), detail_style));
+        }
+
+        if rest.iter().all(|line| line.trim().is_empty()) {
+            lines.push(Line::from(vec![
+                Span::styled("╰─ ", border),
+                Span::styled("läuft …", Style::new().fg(Color::DarkGray)),
+            ]));
+            return lines;
+        }
+
+        let mut index = 0usize;
+        while index < rest.len() {
+            let line = rest[index];
+            if line.trim_start() == "```diff" {
+                let mut diff = Vec::new();
+                index += 1;
+                while index < rest.len() && rest[index].trim_start() != "```" {
+                    diff.push(rest[index]);
+                    index += 1;
+                }
+                lines.extend(diff_lines(&diff, width, border));
+            }
+            index += 1;
+        }
+
+        lines.push(Line::from(Span::styled("╰", border)));
+        return lines;
+    }
 
     if !detail.is_empty() {
         for wrapped in wrap(detail, width.saturating_sub(4).max(1)) {
@@ -102,6 +145,206 @@ fn tool_message_lines(content: &str, width: usize) -> Vec<Line<'static>> {
 
     lines.push(Line::from(Span::styled("╰", border)));
     lines
+}
+
+/// Wie viele Zeilen von Befehl **bzw.** Ausgabe eines bash-Blocks sichtbar
+/// bleiben, bevor der Rest als „… N more lines" eingeklappt wird.
+const BASH_VISIBLE_LINES: usize = 15;
+
+/// Rendert einen bash-Tool-Block: zuerst den exakten Befehl, darunter dessen
+/// exakte Ausgabe — beide unabhängig auf [`BASH_VISIBLE_LINES`] Zeilen begrenzt.
+///
+/// Erwartetes `content`-Format (von [`crate::agent`] bzw. dem Resume-Pfad in
+/// [`crate::app`] erzeugt):
+/// ```text
+/// bash
+/// <befehlszeile 1>
+/// <befehlszeile 2>
+///   → <ausgabezeile 1>   (oder „  ✗ " bei Tool-Fehler — markiert Ausgabebeginn)
+/// <ausgabezeile 2>
+/// ```
+fn bash_message_lines(content: &str, width: usize) -> Vec<Line<'static>> {
+    let border = Style::new().fg(Color::DarkGray);
+    let tool = Style::new().fg(Color::Yellow).bold();
+    let prompt = Style::new().fg(Color::Cyan).bold();
+    let cmd_style = Style::new().fg(Color::Gray);
+
+    // Zerlegen: Befehl läuft bis zur Ergebnis-Markierung („  → " / „  ✗ "), die
+    // zugleich Erfolg/Fehler signalisiert; alles danach ist Ausgabe.
+    let mut command: Vec<&str> = Vec::new();
+    let mut output: Vec<String> = Vec::new();
+    let mut finished = false;
+    let mut ok = true;
+
+    let mut rows = content.split('\n');
+    let _ = rows.next(); // Kopfzeile „bash"
+    for line in rows {
+        if finished {
+            output.push(line.to_string());
+        } else if let Some(rest) = line.strip_prefix("  → ") {
+            finished = true;
+            ok = true;
+            output.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("  ✗ ") {
+            finished = true;
+            ok = false;
+            output.push(rest.to_string());
+        } else {
+            command.push(line);
+        }
+    }
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("╭─ ", border),
+        Span::styled("⚙ ", tool),
+        Span::styled("bash", tool),
+    ])];
+
+    // Befehl (mit „$ "-Prompt auf der ersten Umbruchzeile jeder Befehlszeile).
+    append_capped(
+        &mut lines,
+        command.iter().copied(),
+        command.len(),
+        width,
+        border,
+        Some(("$ ", prompt)),
+        cmd_style,
+    );
+
+    // Noch kein Ergebnis (z. B. abgebrochene/fortgesetzte Sitzung): „läuft …".
+    if !finished {
+        lines.push(Line::from(vec![
+            Span::styled("╰─ ", border),
+            Span::styled("läuft …", Style::new().fg(Color::DarkGray)),
+        ]));
+        return lines;
+    }
+
+    // Dünne Trennzeile, dann die Ausgabe (rot bei Tool-Fehler, sonst neutral).
+    lines.push(Line::from(Span::styled("│", border)));
+    let out_style = if ok {
+        Style::new().fg(Color::Gray)
+    } else {
+        Style::new().fg(Color::Red)
+    };
+    append_capped(
+        &mut lines,
+        output.iter().map(String::as_str),
+        output.len(),
+        width,
+        border,
+        None,
+        out_style,
+    );
+
+    lines.push(Line::from(Span::styled("╰", border)));
+    lines
+}
+
+/// Rendert einen read_file-Tool-Block: oben die gelesene Datei, darunter der
+/// Inhalt. Der Inhalt bleibt wie bei bash vollständig im Message-Body und wird
+/// erst hier auf 15 sichtbare Zeilen plus „… N more lines" begrenzt.
+fn read_file_message_lines(content: &str, width: usize) -> Vec<Line<'static>> {
+    let border = Style::new().fg(Color::DarkGray);
+    let tool = Style::new().fg(Color::Yellow).bold();
+    let path_style = Style::new().fg(Color::Cyan).bold();
+
+    let mut rows = content.split('\n');
+    let head = rows.next().unwrap_or("").trim();
+    let (_, path) = head.split_once(" · ").unwrap_or((head, ""));
+
+    let mut body: Vec<String> = Vec::new();
+    let mut finished = false;
+    let mut ok = true;
+    for line in rows {
+        if finished {
+            body.push(line.to_string());
+        } else if let Some(rest) = line.strip_prefix("  → ") {
+            finished = true;
+            ok = true;
+            body.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("  ✗ ") {
+            finished = true;
+            ok = false;
+            body.push(rest.to_string());
+        }
+    }
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("╭─ ", border),
+        Span::styled("⚙ ", tool),
+        Span::styled("read_file", tool),
+    ])];
+
+    let label = if path.is_empty() { "Datei gelesen" } else { "gelesen: " };
+    let mut spans = vec![
+        Span::styled("│  ", border),
+        Span::styled(label.to_string(), Style::new().fg(Color::DarkGray)),
+    ];
+    if !path.is_empty() {
+        spans.push(Span::styled(path.to_string(), path_style));
+    }
+    lines.push(Line::from(spans));
+
+    if !finished {
+        lines.push(Line::from(vec![
+            Span::styled("╰─ ", border),
+            Span::styled("läuft …", Style::new().fg(Color::DarkGray)),
+        ]));
+        return lines;
+    }
+
+    lines.push(Line::from(Span::styled("│", border)));
+    let text_style = if ok {
+        Style::new().fg(HL_IDENT)
+    } else {
+        Style::new().fg(Color::Red)
+    };
+    append_capped(
+        &mut lines,
+        body.iter().map(String::as_str),
+        body.len(),
+        width,
+        border,
+        None,
+        text_style,
+    );
+    lines.push(Line::from(Span::styled("╰", border)));
+    lines
+}
+
+/// Hängt bis zu [`BASH_VISIBLE_LINES`] Body-Zeilen an `lines` (umgebrochen, mit
+/// Rahmen und optionalem Marker auf der ersten Umbruchzeile) und ergänzt bei
+/// Überlänge eine „… N more lines"-Notiz. `total` ist die Gesamtzahl der
+/// Quellzeilen (für die korrekte Differenz, da `body` schon eine Teil-Iteration
+/// sein darf).
+fn append_capped<'a>(
+    lines: &mut Vec<Line<'static>>,
+    body: impl Iterator<Item = &'a str>,
+    total: usize,
+    width: usize,
+    border: Style,
+    marker: Option<(&'static str, Style)>,
+    text_style: Style,
+) {
+    let marker_width = marker.map_or(0, |(m, _)| m.chars().count());
+    let avail = width.saturating_sub(3 + marker_width).max(1);
+    for text in body.take(BASH_VISIBLE_LINES) {
+        for (i, piece) in wrap(text, avail).into_iter().enumerate() {
+            let mut spans = vec![Span::styled("│  ", border)];
+            match marker {
+                Some((m, m_style)) if i == 0 => spans.push(Span::styled(m, m_style)),
+                Some((m, _)) => spans.push(Span::raw(" ".repeat(m.chars().count()))),
+                None => {}
+            }
+            spans.push(Span::styled(piece, text_style));
+            lines.push(Line::from(spans));
+        }
+    }
+    if total > BASH_VISIBLE_LINES {
+        let hidden = total - BASH_VISIBLE_LINES;
+        lines.push(note_line(&format!("… {hidden} more lines"), border));
+    }
 }
 
 /// Ab dieser Gesamtbreite zeigen wir entfernt/hinzugefügt nebeneinander statt
@@ -415,43 +658,104 @@ fn role_style(role: Role) -> (&'static str, Style) {
     }
 }
 
+/// Plain-Text-Zeilen für den Fullscreen-Resume-Picker.
+pub fn picker_lines(app: &App, width: u16, max_height: u16) -> Vec<String> {
+    let Some(rows) = app.resume_picker_rows() else {
+        return Vec::new();
+    };
+    let width = width as usize;
+    let max_height = max_height as usize;
+    if max_height == 0 {
+        return Vec::new();
+    }
+
+    let mut out = vec![truncate_cols(
+        "Sitzungen — ↑/↓ wählen, Enter öffnen, Esc abbrechen",
+        width,
+    )];
+    let slots = max_height.saturating_sub(1);
+    let selected = rows.iter().position(|(active, _, _)| *active).unwrap_or(0);
+    let start = selected.saturating_sub(slots.saturating_sub(1));
+    let end = (start + slots).min(rows.len());
+    for (active, title, age) in rows.iter().take(end).skip(start) {
+        let marker = if *active { "›" } else { " " };
+        out.push(truncate_cols(&format!("  {marker} {title} · {age}"), width));
+    }
+    out
+}
+
 /// Zeichnet den Viewport (das kompakte Fenster unten). `frame.area()` ist hier
 /// der Inline-Viewport, nicht der ganze Bildschirm.
 pub fn render_viewport(frame: &mut Frame, app: &App) {
-    let area = frame.area();
+    let viewport_area = frame.area();
+    let picker_rows = app.resume_picker_rows();
+    let suggestions = app.command_suggestions();
+    let picker_visible = 0usize;
+    let suggestion_visible = if picker_rows.is_some() {
+        0
+    } else {
+        suggestions_visible_lines(&suggestions, viewport_area.height.saturating_sub(1))
+    };
+    let overlay_visible = picker_visible.max(suggestion_visible);
+    let content_height = viewport_area.height.max(1);
+    let area = Rect {
+        y: viewport_area.bottom().saturating_sub(content_height),
+        height: content_height,
+        ..viewport_area
+    };
 
     // Spinner/Hinweis sitzt im Titel der oberen Linie — so braucht es keine
     // eigene Zeile (und keine Leerzeile im Leerlauf). Die maskierte Key-Eingabe
     // hat Vorrang vor dem Status.
-    let title = if app.masking() {
-        Span::styled(
+    let status_line = if app.masking() {
+        Line::from(Span::styled(
             " 🔑 API-Key eingeben — Enter speichert, Esc bricht ab".to_string(),
             Style::new().fg(Color::Magenta),
-        )
+        ))
     } else {
         match app.status {
-            Status::Thinking => Span::styled(
-                format!(" {} anvil arbeitet …  (Esc bricht ab)", app.spinner()),
-                Style::new().fg(Color::Yellow),
-            ),
-            Status::AwaitingAnswer => Span::styled(
+            Status::Thinking => {
+                let mut spans = vec![Span::styled(
+                    format!(" {} anvil arbeitet …", app.spinner()),
+                    Style::new().fg(Color::Yellow),
+                )];
+                if app.stalled_hint() {
+                    spans.push(Span::styled(
+                        "  ·  seit >90s keine Daten vom Stream".to_string(),
+                        Style::new().fg(Color::Red),
+                    ));
+                }
+                if let Some(label) = app.active_label() {
+                    spans.push(Span::styled("  ·  ".to_string(), Style::new().fg(Color::DarkGray)));
+                    spans.push(Span::styled(label, Style::new().fg(Color::DarkGray)));
+                }
+                spans.push(Span::styled(
+                    "  (Esc bricht ab)".to_string(),
+                    Style::new().fg(Color::DarkGray),
+                ));
+                Line::from(spans)
+            }
+            Status::AwaitingAnswer => Line::from(Span::styled(
                 " ⌨ Rückfrage — gib deine Antwort ein".to_string(),
                 Style::new().fg(Color::Magenta),
-            ),
+            )),
             // Im Leerlauf das aktive Modell dezent anzeigen (wie opencodes Status).
             Status::Idle => match app.active_label() {
-                Some(label) => Span::styled(format!(" {label}"), Style::new().fg(Color::DarkGray)),
-                None => Span::raw(String::new()),
+                Some(label) => Line::from(Span::styled(format!(" {label}"), Style::new().fg(Color::DarkGray))),
+                None => Line::from(Span::raw(String::new())),
             },
         }
     };
 
     let block = Block::default()
         .borders(Borders::TOP)
-        .title(title)
+        .title(status_line)
+        .title(Line::from(Span::styled(token_label(app), Style::new().fg(Color::DarkGray))))
         .padding(Padding::right(2));
     let inner = block.inner(area);
-    let input_visible = (inner.height as usize).max(1);
+    let input_visible = (inner.height as usize)
+        .saturating_sub(overlay_visible)
+        .max(1);
 
     // Eingabe visuell umbrechen + Cursor-Position (Zeile/Spalte) bestimmen. Bei
     // maskierter Key-Eingabe (/login) `*` statt der echten Zeichen zeigen —
@@ -474,7 +778,7 @@ pub fn render_viewport(frame: &mut Frame, app: &App) {
         Color::Cyan
     };
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut input_lines: Vec<Line<'static>> = Vec::new();
     for (index, text) in visual_lines
         .iter()
         .enumerate()
@@ -482,18 +786,161 @@ pub fn render_viewport(frame: &mut Frame, app: &App) {
         .take(input_visible)
     {
         let prefix = if index == 0 { "❯ " } else { "  " };
-        lines.push(Line::from(vec![
-            Span::styled(prefix, Style::new().fg(chevron_color)),
-            Span::raw(text.clone()),
-        ]));
+        let mut spans = vec![Span::styled(prefix, Style::new().fg(chevron_color))];
+        spans.extend(input_spans(text));
+        input_lines.push(Line::from(spans));
     }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(rows) = picker_rows.as_ref() {
+        append_resume_picker_lines(&mut lines, rows, picker_visible);
+    } else if suggestion_visible > 0 {
+        append_suggestion_lines(
+            &mut lines,
+            &suggestions,
+            app.selected_suggestion_index(),
+            suggestion_visible,
+        );
+    }
+    lines.extend(input_lines);
     frame.render_widget(Paragraph::new(lines).block(block), area);
 
     // Cursor positionieren (hinter Indikator + getippte Zeichen, am Rand geklemmt).
     let display_row = (cursor_row - scroll) as u16;
+    let cursor_y = inner.y + overlay_visible as u16 + display_row;
     let cursor_x =
         (inner.x + PROMPT_WIDTH + cursor_col as u16).min(inner.x + inner.width.saturating_sub(1));
-    frame.set_cursor_position(Position::new(cursor_x, inner.y + display_row));
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+fn token_label(app: &App) -> String {
+    let stats = app.token_stats();
+    let limit = stats
+        .context_limit
+        .map(format_tokens)
+        .unwrap_or_else(|| "?".to_string());
+    format!(
+        " ↓{} ↑{} ctx {}/{} ",
+        format_tokens(stats.sent_since_prompt),
+        format_tokens(stats.received_since_command),
+        format_tokens(stats.context),
+        limit
+    )
+}
+
+fn format_tokens(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 10_000 {
+        format!("{}k", tokens / 1_000)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Hebt Slash-Commands in der Eingabe hervor.
+fn input_spans(text: &str) -> Vec<Span<'static>> {
+    if !text.starts_with('/') {
+        return vec![Span::raw(text.to_string())];
+    }
+
+    let command_end = text
+        .char_indices()
+        .find_map(|(index, c)| (index > 0 && c.is_whitespace()).then_some(index))
+        .unwrap_or(text.len());
+    let (command, rest) = text.split_at(command_end);
+    let mut spans = vec![Span::styled(
+        command.to_string(),
+        Style::new().fg(Color::Magenta).bold(),
+    )];
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), Style::new().fg(Color::Gray)));
+    }
+    spans
+}
+
+fn append_resume_picker_lines(
+    lines: &mut Vec<Line<'static>>,
+    rows: &[(bool, String, String)],
+    visible: usize,
+) {
+    if visible == 0 {
+        return;
+    }
+    let title_style = Style::new().fg(Color::DarkGray);
+    let selected_style = Style::new().fg(Color::Magenta).bold();
+    let normal_style = Style::new().fg(Color::Gray);
+    let time_style = Style::new().fg(Color::DarkGray);
+    lines.push(Line::from(vec![
+        Span::styled("  Sitzungen — ↑/↓ wählen, Enter öffnen, Esc abbrechen", title_style),
+    ]));
+
+    let row_slots = visible.saturating_sub(1);
+    let selected = rows.iter().position(|(active, _, _)| *active).unwrap_or(0);
+    let start = selected.saturating_sub(row_slots.saturating_sub(1));
+    let end = (start + row_slots).min(rows.len());
+    for (active, title, age) in rows.iter().take(end).skip(start) {
+        let marker = if *active { "›" } else { " " };
+        let style = if *active { selected_style } else { normal_style };
+        lines.push(Line::from(vec![
+            Span::styled("  ", time_style),
+            Span::styled(marker.to_string(), if *active { selected_style } else { time_style }),
+            Span::raw(" "),
+            Span::styled(title.clone(), style),
+            Span::styled(format!(" · {age}"), time_style),
+        ]));
+    }
+}
+
+fn suggestions_visible_lines(suggestions: &[CommandSuggestion], height: u16) -> usize {
+    if suggestions.is_empty() || height < 3 {
+        0
+    } else {
+        suggestions.len().min((height as usize).saturating_sub(1)).min(5)
+    }
+}
+
+fn append_suggestion_lines(
+    lines: &mut Vec<Line<'static>>,
+    suggestions: &[CommandSuggestion],
+    selected: usize,
+    visible: usize,
+) {
+    let border = Style::new().fg(Color::DarkGray);
+    let selected_style = Style::new().fg(Color::Magenta).bold();
+    let command_style = Style::new().fg(Color::Cyan);
+    let hint_style = Style::new().fg(Color::DarkGray);
+    let total = suggestions.len();
+    let note_needed = total > visible;
+    let slots = if note_needed { visible.saturating_sub(1) } else { visible };
+    let selected = selected.min(total.saturating_sub(1));
+    let start = selected.saturating_sub(slots.saturating_sub(1));
+    let end = (start + slots).min(total);
+
+    for (index, suggestion) in suggestions.iter().enumerate().take(end).skip(start) {
+        let active = index == selected;
+        let marker = if active { "›" } else { " " };
+        let style = if active { selected_style } else { command_style };
+        lines.push(Line::from(vec![
+            Span::styled("  ", border),
+            Span::styled(marker.to_string(), if active { selected_style } else { border }),
+            Span::raw(" "),
+            Span::styled(format!("/{:<10}", suggestion.name), style),
+            Span::styled(suggestion.hint.to_string(), hint_style),
+        ]));
+    }
+
+    if note_needed {
+        lines.push(Line::from(vec![
+            Span::styled("    ", border),
+            Span::styled(
+                format!("… {} more", total - slots),
+                Style::new().fg(Color::DarkGray).italic(),
+            ),
+        ]));
+    }
 }
 
 /// Bricht die Prompt-Eingabe hart auf verfügbare Spalten um und liefert dazu
@@ -647,6 +1094,101 @@ mod tests {
         let spans = tokenize(line);
         let rebuilt: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt, line, "Tokenizer darf keine Zeichen verlieren");
+    }
+
+    #[test]
+    fn bash_block_shows_full_command_and_output() {
+        let content = "bash\nls -la src\n  → main.rs\napp.rs\n[exit 0]";
+        let rendered: Vec<String> = tool_message_lines(content, 80).iter().map(plain).collect();
+        assert!(rendered.iter().any(|l| l.contains("⚙") && l.contains("bash")));
+        assert!(rendered.iter().any(|l| l.contains("$ ls -la src")));
+        assert!(rendered.iter().any(|l| l.contains("main.rs")));
+        assert!(rendered.iter().any(|l| l.contains("app.rs")));
+        assert!(rendered.iter().any(|l| l.contains("[exit 0]")));
+    }
+
+    #[test]
+    fn bash_block_caps_output_at_fifteen_lines() {
+        // 20 Ausgabezeilen (l1..l20) → 15 sichtbar, „… 5 more lines".
+        let mut content = String::from("bash\necho many\n  → l1");
+        for i in 2..=20 {
+            content.push_str(&format!("\nl{i}"));
+        }
+        let rendered: Vec<String> = tool_message_lines(&content, 80).iter().map(plain).collect();
+        assert!(rendered.iter().any(|l| l.contains("l15")));
+        assert!(
+            !rendered.iter().any(|l| l.contains("l16")),
+            "Zeile 16 muss eingeklappt sein"
+        );
+        assert!(rendered.iter().any(|l| l.contains("… 5 more lines")));
+    }
+
+    #[test]
+    fn bash_block_caps_command_at_fifteen_lines() {
+        // 20 Befehlszeilen (cmd1..cmd20) → 15 sichtbar, „… 5 more lines".
+        let mut content = String::from("bash");
+        for i in 1..=20 {
+            content.push_str(&format!("\ncmd{i}"));
+        }
+        content.push_str("\n  → done\n[exit 0]");
+        let rendered: Vec<String> = tool_message_lines(&content, 80).iter().map(plain).collect();
+        assert!(rendered.iter().any(|l| l.contains("cmd15")));
+        assert!(
+            !rendered.iter().any(|l| l.contains("cmd16")),
+            "Befehlszeile 16 muss eingeklappt sein"
+        );
+        assert!(rendered.iter().any(|l| l.contains("… 5 more lines")));
+        // Ausgabe bleibt unabhängig davon vollständig sichtbar.
+        assert!(rendered.iter().any(|l| l.contains("done")));
+    }
+
+    #[test]
+    fn bash_block_without_result_shows_running() {
+        let content = "bash\nsleep 5";
+        let rendered: Vec<String> = tool_message_lines(content, 80).iter().map(plain).collect();
+        assert!(rendered.iter().any(|l| l.contains("$ sleep 5")));
+        assert!(rendered.iter().any(|l| l.contains("läuft")));
+    }
+
+    #[test]
+    fn bash_block_marks_error_output() {
+        let content = "bash\nrm -rf x\n  ✗ bash ist read-only: nutze write_file";
+        let rendered: Vec<String> = tool_message_lines(content, 80).iter().map(plain).collect();
+        assert!(rendered.iter().any(|l| l.contains("$ rm -rf x")));
+        assert!(rendered.iter().any(|l| l.contains("bash ist read-only")));
+    }
+
+    #[test]
+    fn read_file_block_shows_path_and_content() {
+        let content = "read_file · src/main.rs\n  → fn main() {\n    println!(\"hi\");\n}";
+        let rendered: Vec<String> = tool_message_lines(content, 80).iter().map(plain).collect();
+        assert!(rendered.iter().any(|l| l.contains("⚙") && l.contains("read_file")));
+        assert!(rendered.iter().any(|l| l.contains("gelesen: src/main.rs")));
+        assert!(rendered.iter().any(|l| l.contains("fn main()")));
+        assert!(rendered.iter().any(|l| l.contains("println!")));
+    }
+
+    #[test]
+    fn read_file_block_caps_content_at_fifteen_lines() {
+        let mut content = String::from("read_file · big.txt\n  → l1");
+        for i in 2..=20 {
+            content.push_str(&format!("\nl{i}"));
+        }
+        let rendered: Vec<String> = tool_message_lines(&content, 80).iter().map(plain).collect();
+        assert!(rendered.iter().any(|l| l.contains("l15")));
+        assert!(
+            !rendered.iter().any(|l| l.contains("l16")),
+            "Zeile 16 muss eingeklappt sein"
+        );
+        assert!(rendered.iter().any(|l| l.contains("… 5 more lines")));
+    }
+
+    #[test]
+    fn edit_file_block_shows_path_inline_and_hides_success_line() {
+        let content = "edit_file · src/ui.rs\n  → Datei bearbeitet: src/ui.rs.";
+        let rendered: Vec<String> = tool_message_lines(content, 80).iter().map(plain).collect();
+        assert!(rendered[0].contains("⚙ edit_file") && rendered[0].contains("src/ui.rs"));
+        assert!(!rendered.iter().any(|l| l.contains("Datei bearbeitet")));
     }
 
     #[test]

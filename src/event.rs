@@ -3,7 +3,9 @@
 //! Die einzige Schnittstelle zwischen den beiden Welten: Die UI schickt
 //! [`AgentCommand`]s rein, der Agent meldet [`AgentEvent`]s zurück.
 
+use crate::auth::AuthInfo;
 use crate::llm::{ChatMessage, ProviderKind, Secret};
+use crate::tokens::TokenStats;
 
 /// Was die UI dem Agent-Task aufträgt.
 #[derive(Debug, Clone)]
@@ -22,7 +24,12 @@ pub enum AgentCommand {
         kind: ProviderKind,
         model: String,
         secret: Secret,
+        auth_info: Option<AuthInfo>,
     },
+    /// Einen OAuth-/Subscription-Login im Agent-Task ausführen (blockiert die UI nicht).
+    LoginOauth { kind: ProviderKind },
+    /// Verdichtet den bisherigen Gesprächskontext zu einer Summary plus Recent-Tail.
+    Compact,
     /// Eine frische Sitzung beginnen (Kontext leeren).
     Reset,
 }
@@ -32,6 +39,12 @@ pub enum AgentCommand {
 pub enum AgentEvent {
     /// Ein Stück gestreamter Assistenten-Text.
     Chunk(String),
+    /// Aktualisierte Token-Zähler für das Prompt-Label.
+    TokenStats(TokenStats),
+    /// Eine manuelle Kontextverdichtung läuft gerade.
+    CompactStarted,
+    /// Kontext wurde verdichtet; enthält Summary und erhaltenen Recent-Kontext.
+    Compacted { summary: String, recent: String },
     /// Ein Tool wird ausgeführt (z. B. `"bash · ls -la"`).
     ToolStarted(String),
     /// Das zuletzt gestartete Tool ist fertig.
